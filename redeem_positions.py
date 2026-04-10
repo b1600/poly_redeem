@@ -474,9 +474,11 @@ def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
                 params={"user": clob_address},
                 timeout=15,
             )
+            print(f"  CLOB positions API status: {resp.status_code}")
             if resp.status_code == 200:
                 data = resp.json()
                 positions = data if isinstance(data, list) else data.get("data", [])
+                print(f"  CLOB positions API raw count: {len(positions)}")
                 for pos in positions:
                     cid = pos.get("conditionId") or pos.get("condition_id", "")
                     if not cid:
@@ -490,7 +492,10 @@ def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
                     print(f"  Found {len(conditions)} conditions via CLOB positions API")
                     return conditions
                 else:
-                    print("  CLOB positions API returned no positions, falling back to Gamma API")
+                    print(f"  CLOB positions API returned no usable conditions (raw: {str(data)[:200]})")
+                    print("  Falling back to Gamma API...")
+            else:
+                print(f"  CLOB positions API error response: {resp.text[:200]}")
         except Exception as e:
             print(f"  CLOB positions API error: {e}")
 
@@ -843,11 +848,26 @@ def main():
             print(f"\n{'#' * 60}")
             print(f"# CYCLE {cycle}  —  {time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'#' * 60}")
-            try:
-                run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
-                         proxy_address, proxy_contract)
-            except Exception as e:
-                print(f"❌ Cycle {cycle} error: {e}")
+            # Retry up to 3 times on network/connection errors before giving up
+            for attempt in range(1, 4):
+                try:
+                    run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
+                             proxy_address, proxy_contract)
+                    break  # success
+                except Exception as e:
+                    err = str(e)
+                    is_network = any(k in err for k in (
+                        "NameResolutionError", "ConnectionError", "Max retries",
+                        "RemoteDisconnected", "TimeoutError", "ConnectTimeout",
+                    ))
+                    if is_network and attempt < 3:
+                        wait = 60 * attempt  # 1 min, then 2 min
+                        print(f"⚠️  Network error (attempt {attempt}/3): {err[:120]}")
+                        print(f"   Retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        print(f"❌ Cycle {cycle} error (attempt {attempt}/3): {e}")
+                        break
             print(f"\n⏳ Next run in {LOOP_INTERVAL_SECONDS // 60} minutes...")
             time.sleep(LOOP_INTERVAL_SECONDS)
     except KeyboardInterrupt:
