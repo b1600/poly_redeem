@@ -39,7 +39,8 @@ class _Tee:
     """
 
     _TELEGRAM_MAX = 4000   # chars per message (Telegram limit is 4096)
-    _FLUSH_INTERVAL = 2.0  # seconds between Telegram sends
+    _COLLECT_INTERVAL = 5.0  # seconds to accumulate output before sending
+    _SEND_DELAY = 1.1        # seconds between sends (Telegram: max 1 msg/sec)
 
     def __init__(self, log_path: str, tg_token: str, tg_chat_id: str):
         self._stdout = sys.stdout
@@ -48,7 +49,6 @@ class _Tee:
         self._tg_chat_id = tg_chat_id
         self._tg_enabled = bool(tg_token and tg_chat_id)
 
-        self._buf = ""          # partial-line buffer for Telegram batching
         self._tg_queue: queue.Queue = queue.Queue()
 
         if self._tg_enabled:
@@ -56,7 +56,8 @@ class _Tee:
             t.start()
 
     # ------------------------------------------------------------------
-    # Background worker — pulls batches from queue and POSTs to Telegram
+    # Background worker — collects output for 5s then sends in chunks,
+    # respecting Telegram's 1 message/second rate limit.
     # ------------------------------------------------------------------
     def _tg_worker(self):
         import requests as _req
@@ -64,21 +65,27 @@ class _Tee:
         pending = ""
 
         while True:
-            try:
-                chunk = self._tg_queue.get(timeout=self._FLUSH_INTERVAL)
-                if chunk is None:       # sentinel → shut down
+            # Drain the queue for up to _COLLECT_INTERVAL seconds
+            deadline = time.monotonic() + self._COLLECT_INTERVAL
+            while time.monotonic() < deadline:
+                try:
+                    chunk = self._tg_queue.get(timeout=max(0.1, deadline - time.monotonic()))
+                    if chunk is None:   # sentinel → shut down
+                        return
+                    pending += chunk
+                except queue.Empty:
                     break
-                pending += chunk
-            except queue.Empty:
-                pass  # timeout — flush whatever we have
 
-            # Send when we have content (split at max size)
-            while len(pending) >= self._TELEGRAM_MAX:
-                self._post(url, _req, pending[:self._TELEGRAM_MAX])
+            if not pending.strip():
+                continue
+
+            # Send in ≤4000-char slices with a delay between each
+            while pending:
+                slice_ = pending[:self._TELEGRAM_MAX]
                 pending = pending[self._TELEGRAM_MAX:]
-            if pending.strip():
-                self._post(url, _req, pending)
-                pending = ""
+                self._post(url, _req, slice_)
+                if pending.strip():
+                    time.sleep(self._SEND_DELAY)
 
     def _post(self, url: str, _req, text: str):
         try:
@@ -122,6 +129,10 @@ from web3.middleware import ExtraDataToPOAMiddleware
 PRIVATE_KEY = os.environ.get("POLYGON_PRIVATE_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Polymarket proxy wallet — holds CTF tokens and USDC.e.
+# The EOA (PRIVATE_KEY) only pays gas; all positions live here.
+# Find yours at: https://polygonscan.com/address/<your_eoa>#tokentxns
+POLYMARKET_PROXY_ADDRESS = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
 
 sys.stdout = _Tee(LOG_PATH, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -242,6 +253,24 @@ USDC_ABI = json.loads("""[
         "name": "balanceOf",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
+        "type": "function"
+    }
+]""")
+
+# Polymarket proxy wallet — forwards arbitrary calls on behalf of the EOA owner.
+PROXY_ABI = json.loads("""[
+    {
+        "inputs": [
+            {"name": "to",    "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data",  "type": "bytes"}
+        ],
+        "name": "execute",
+        "outputs": [
+            {"name": "success",    "type": "bool"},
+            {"name": "returnData", "type": "bytes"}
+        ],
+        "stateMutability": "nonpayable",
         "type": "function"
     }
 ]""")
@@ -478,109 +507,134 @@ def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
 def check_and_redeem(
     w3: Web3,
     ctf_contract,
-    wallet_address: str,
+    eoa_address: str,
     condition_id_hex: str,
     market_info: dict,
     execute: bool = False,
+    proxy_address: str = "",
+    proxy_contract=None,
 ) -> Optional[str]:
     """
     Check if a condition is resolved, if we have winning tokens, and redeem.
+
+    If proxy_address is set:
+      - balances are checked on the proxy (it holds the CTF tokens)
+      - redemption is executed via proxy.execute(CTF, redeemPositions_calldata)
+        so USDC.e lands back in the proxy
+    Otherwise falls back to direct call from the EOA.
+
     Returns tx hash if redeemed, None otherwise.
     """
+    # The address that actually holds the tokens
+    holder = Web3.to_checksum_address(proxy_address) if proxy_address else eoa_address
+
     condition_id_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
-    
+
     # Check if condition is resolved (payoutDenominator > 0 means resolved)
     try:
         payout_denominator = ctf_contract.functions.payoutDenominator(condition_id_bytes).call()
     except Exception:
         return None
-    
+
     if payout_denominator == 0:
         print(f"  ⏳ Not yet resolved: {market_info.get('question', condition_id_hex[:20])}")
         return None
-    
+
     # Get payout numerators for both outcomes
     payout_0 = ctf_contract.functions.payoutNumerators(condition_id_bytes, 0).call()
     payout_1 = ctf_contract.functions.payoutNumerators(condition_id_bytes, 1).call()
-    
+
     winning_index = 0 if payout_0 > 0 else 1
     winning_label = "Yes/Up" if winning_index == 0 else "No/Down"
-    
+
     # Compute position IDs for both outcomes
     collection_id_0 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 1)  # indexSet=1 -> outcome 0
     collection_id_1 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 2)  # indexSet=2 -> outcome 1
-    
+
     position_id_0 = get_position_id(USDC_E_ADDRESS, collection_id_0)
     position_id_1 = get_position_id(USDC_E_ADDRESS, collection_id_1)
-    
-    # Check our balance for both outcomes
-    balance_0 = ctf_contract.functions.balanceOf(wallet_address, position_id_0).call()
-    balance_1 = ctf_contract.functions.balanceOf(wallet_address, position_id_1).call()
-    
+
+    # Check balance on the token holder (proxy or EOA)
+    balance_0 = ctf_contract.functions.balanceOf(holder, position_id_0).call()
+    balance_1 = ctf_contract.functions.balanceOf(holder, position_id_1).call()
+
     winning_balance = balance_0 if winning_index == 0 else balance_1
     losing_balance = balance_1 if winning_index == 0 else balance_0
-    
+
     if winning_balance == 0 and losing_balance == 0:
         return None  # No tokens to redeem
-    
-    # Calculate expected payout (USDC.e has 6 decimals, but CTF tokens are in raw units)
-    # Each winning token redeems for (payout_numerator / payout_denominator) of collateral
-    # In Polymarket binary markets: 1 winning share = 1 USDC.e unit of collateral
-    winning_payout_usdc = winning_balance / 1_000_000  # Convert to USDC
-    
+
+    winning_payout_usdc = winning_balance / 1_000_000
+
     question = market_info.get("question", f"Condition {condition_id_hex[:20]}...")
     print(f"\n  ✅ RESOLVED: {question}")
     print(f"     Winner: {winning_label} (payout: [{payout_0}/{payout_1}], denom: {payout_denominator})")
-    print(f"     Your winning tokens: {winning_balance:,} (≈ ${winning_payout_usdc:.6f} USDC.e)")
+    print(f"     Winning tokens ({holder[:10]}...): {winning_balance:,} (≈ ${winning_payout_usdc:.6f} USDC.e)")
     if losing_balance > 0:
-        print(f"     Your losing tokens:  {losing_balance:,} (worthless)")
-    
+        print(f"     Losing tokens: {losing_balance:,} (worthless)")
+
     if winning_balance == 0:
         print(f"     ❌ You hold only losing tokens — nothing to redeem.")
         return None
-    
+
     if not execute:
         print(f"     🔍 DRY RUN — would redeem {winning_balance:,} winning tokens")
         return "DRY_RUN"
-    
+
     # Execute redemption
     print(f"     🔄 Redeeming...")
     try:
-        # Build transaction
-        nonce = w3.eth.get_transaction_count(wallet_address)
-        
-        # Estimate gas
-        tx = ctf_contract.functions.redeemPositions(
-            Web3.to_checksum_address(USDC_E_ADDRESS),
-            PARENT_COLLECTION_ID,
-            condition_id_bytes,
-            INDEX_SETS,
-        ).build_transaction({
-            "from": wallet_address,
+        nonce = w3.eth.get_transaction_count(eoa_address)
+        base = {
+            "from": eoa_address,
             "nonce": nonce,
-            "gas": 300_000,
+            "gas": 400_000,
             "maxFeePerGas": w3.eth.gas_price * 2,
             "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
             "chainId": 137,
-        })
-        
-        # Sign and send
+        }
+
+        if proxy_contract and proxy_address:
+            # Encode the redeemPositions call and forward it through the proxy
+            redeem_calldata = ctf_contract.encode_abi(
+                "redeemPositions",
+                args=[
+                    Web3.to_checksum_address(USDC_E_ADDRESS),
+                    PARENT_COLLECTION_ID,
+                    condition_id_bytes,
+                    INDEX_SETS,
+                ],
+            )
+            tx = proxy_contract.functions.execute(
+                Web3.to_checksum_address(CTF_ADDRESS),
+                0,
+                redeem_calldata,
+            ).build_transaction(base)
+            print(f"     📡 Routing through proxy: {proxy_address[:10]}...")
+        else:
+            tx = ctf_contract.functions.redeemPositions(
+                Web3.to_checksum_address(USDC_E_ADDRESS),
+                PARENT_COLLECTION_ID,
+                condition_id_bytes,
+                INDEX_SETS,
+            ).build_transaction(base)
+
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         tx_hash_hex = w3.to_hex(tx_hash)
-        
+
         print(f"     📤 Tx sent: {tx_hash_hex}")
         print(f"     ⏳ Waiting for confirmation...")
-        
+
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-        
+
         if receipt["status"] == 1:
             print(f"     ✅ Redeemed! Gas used: {receipt['gasUsed']:,}")
             return tx_hash_hex
         else:
             print(f"     ❌ Transaction reverted!")
             return None
-            
+
     except Exception as e:
         print(f"     ❌ Error: {e}")
         return None
@@ -589,17 +643,20 @@ def check_and_redeem(
 LOOP_INTERVAL_SECONDS = 600  # 10 minutes
 
 
-def run_once(w3, ctf_contract, usdc_contract, wallet_address, args):
-    """Run one full scan-and-redeem cycle. Returns USDC.e balance before the cycle."""
-    # Check POL balance for gas
-    pol_balance = w3.eth.get_balance(wallet_address)
-    print(f"⛽ POL balance: {w3.from_wei(pol_balance, 'ether'):.4f} POL")
+def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
+             proxy_address="", proxy_contract=None):
+    """Run one full scan-and-redeem cycle."""
+    # Tokens and USDC live in the proxy; gas comes from the EOA
+    holder = Web3.to_checksum_address(proxy_address) if proxy_address else eoa_address
 
+    pol_balance = w3.eth.get_balance(eoa_address)
+    print(f"⛽ POL balance (EOA): {w3.from_wei(pol_balance, 'ether'):.4f} POL")
     if pol_balance < w3.to_wei(0.01, "ether"):
         print("⚠️  Low POL balance — you may not have enough gas to redeem.")
 
-    usdc_before = usdc_contract.functions.balanceOf(wallet_address).call()
-    print(f"💰 USDC.e balance (before): {usdc_before / 1_000_000:.6f}")
+    usdc_before = usdc_contract.functions.balanceOf(holder).call()
+    print(f"💰 USDC.e balance (proxy): {usdc_before / 1_000_000:.6f}" if proxy_address
+          else f"💰 USDC.e balance: {usdc_before / 1_000_000:.6f}")
 
     # If specific condition ID provided, just redeem that one
     if args.condition_id:
@@ -620,16 +677,17 @@ def run_once(w3, ctf_contract, usdc_contract, wallet_address, args):
         except Exception:
             pass
 
-        check_and_redeem(w3, ctf_contract, wallet_address, cid, info, args.execute)
-        return usdc_before
+        check_and_redeem(w3, ctf_contract, eoa_address, cid, info, args.execute,
+                         proxy_address, proxy_contract)
+        return
 
-    # Discover positions
+    # Discover positions — scan the holder address (proxy or EOA)
     print("\n" + "=" * 60)
     print("PHASE 1: Discovering your positions")
     print("=" * 60)
 
     condition_ids_from_events, token_ids = discover_condition_ids_from_logs(
-        w3, wallet_address, ctf_contract
+        w3, holder, ctf_contract
     )
 
     print("\nLooking up market info from Gamma API...")
@@ -654,8 +712,8 @@ def run_once(w3, ctf_contract, usdc_contract, wallet_address, args):
         print("   - PolygonScan API rate limited (try adding POLYGONSCAN_API_KEY)")
         print("   - Try passing --condition-id directly if you know the condition")
         print(f"\n   You can also manually check your tokens at:")
-        print(f"   https://polygonscan.com/token/{CTF_ADDRESS}?a={wallet_address}")
-        return usdc_before
+        print(f"   https://polygonscan.com/token/{CTF_ADDRESS}?a={holder}")
+        return
 
     print(f"\n{'=' * 60}")
     print(f"PHASE 2: Checking {len(all_condition_ids)} conditions for redemption")
@@ -666,7 +724,10 @@ def run_once(w3, ctf_contract, usdc_contract, wallet_address, args):
     no_balance = 0
 
     for cid_hex, info in all_condition_ids.items():
-        result = check_and_redeem(w3, ctf_contract, wallet_address, cid_hex, info, args.execute)
+        result = check_and_redeem(
+            w3, ctf_contract, eoa_address, cid_hex, info, args.execute,
+            proxy_address, proxy_contract,
+        )
         if result == "DRY_RUN":
             redeemed += 1
         elif result is not None:
@@ -692,15 +753,13 @@ def run_once(w3, ctf_contract, usdc_contract, wallet_address, args):
     print(f"  No balance/already redeemed: {no_balance}")
 
     if args.execute and redeemed > 0:
-        usdc_after = usdc_contract.functions.balanceOf(wallet_address).call()
+        usdc_after = usdc_contract.functions.balanceOf(holder).call()
         gained = (usdc_after - usdc_before) / 1_000_000
         print(f"\n  💰 USDC.e before: {usdc_before / 1_000_000:.6f}")
         print(f"  💰 USDC.e after:  {usdc_after / 1_000_000:.6f}")
         print(f"  💰 Gained:        {gained:.6f} USDC.e")
     elif not args.execute and redeemed > 0:
         print(f"\n  ℹ️  Run with --execute to actually redeem")
-
-    return usdc_before
 
 
 def main():
@@ -724,8 +783,17 @@ def main():
         sys.exit(1)
 
     account = w3.eth.account.from_key(PRIVATE_KEY)
-    wallet_address = account.address
-    print(f"🔑 Wallet: {wallet_address}")
+    eoa_address = account.address
+    print(f"🔑 EOA (signer/gas): {eoa_address}")
+
+    proxy_address = ""
+    proxy_contract = None
+    if POLYMARKET_PROXY_ADDRESS:
+        proxy_address = Web3.to_checksum_address(POLYMARKET_PROXY_ADDRESS)
+        proxy_contract = w3.eth.contract(address=proxy_address, abi=PROXY_ABI)
+        print(f"🏦 Proxy (holds tokens): {proxy_address}")
+    else:
+        print("ℹ️  No POLYMARKET_PROXY_ADDRESS set — scanning EOA directly.")
 
     usdc_contract = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=USDC_ABI
@@ -735,7 +803,8 @@ def main():
     )
 
     if args.once:
-        run_once(w3, ctf_contract, usdc_contract, wallet_address, args)
+        run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
+                 proxy_address, proxy_contract)
         return
 
     print(f"🔁 Running continuously every {LOOP_INTERVAL_SECONDS // 60} minutes. Press Ctrl+C to stop.\n")
@@ -747,7 +816,8 @@ def main():
             print(f"# CYCLE {cycle}  —  {time.strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"{'#' * 60}")
             try:
-                run_once(w3, ctf_contract, usdc_contract, wallet_address, args)
+                run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
+                         proxy_address, proxy_contract)
             except Exception as e:
                 print(f"❌ Cycle {cycle} error: {e}")
             print(f"\n⏳ Next run in {LOOP_INTERVAL_SECONDS // 60} minutes...")
