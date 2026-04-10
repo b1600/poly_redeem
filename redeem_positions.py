@@ -23,20 +23,81 @@ Environment variables (or edit the CONFIG section below):
 import argparse
 import json
 import os
+import queue
 import sys
+import threading
 import time
 from typing import Optional
 
 
 class _Tee:
-    """Write to both the original stdout and a log file simultaneously."""
-    def __init__(self, log_path: str):
+    """
+    Write to stdout, a log file, and a Telegram chat simultaneously.
+    Telegram messages are sent in a background thread to avoid blocking.
+    Lines are batched (up to 4000 chars) before sending to stay within
+    Telegram's message-size limit and reduce API calls.
+    """
+
+    _TELEGRAM_MAX = 4000   # chars per message (Telegram limit is 4096)
+    _FLUSH_INTERVAL = 2.0  # seconds between Telegram sends
+
+    def __init__(self, log_path: str, tg_token: str, tg_chat_id: str):
         self._stdout = sys.stdout
         self._file = open(log_path, "a", buffering=1, encoding="utf-8")
+        self._tg_token = tg_token
+        self._tg_chat_id = tg_chat_id
+        self._tg_enabled = bool(tg_token and tg_chat_id)
 
+        self._buf = ""          # partial-line buffer for Telegram batching
+        self._tg_queue: queue.Queue = queue.Queue()
+
+        if self._tg_enabled:
+            t = threading.Thread(target=self._tg_worker, daemon=True)
+            t.start()
+
+    # ------------------------------------------------------------------
+    # Background worker — pulls batches from queue and POSTs to Telegram
+    # ------------------------------------------------------------------
+    def _tg_worker(self):
+        import requests as _req
+        url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
+        pending = ""
+
+        while True:
+            try:
+                chunk = self._tg_queue.get(timeout=self._FLUSH_INTERVAL)
+                if chunk is None:       # sentinel → shut down
+                    break
+                pending += chunk
+            except queue.Empty:
+                pass  # timeout — flush whatever we have
+
+            # Send when we have content (split at max size)
+            while len(pending) >= self._TELEGRAM_MAX:
+                self._post(url, _req, pending[:self._TELEGRAM_MAX])
+                pending = pending[self._TELEGRAM_MAX:]
+            if pending.strip():
+                self._post(url, _req, pending)
+                pending = ""
+
+    def _post(self, url: str, _req, text: str):
+        try:
+            _req.post(url, json={
+                "chat_id": self._tg_chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+            }, timeout=10)
+        except Exception:
+            pass  # never crash the bot because Telegram is unreachable
+
+    # ------------------------------------------------------------------
+    # sys.stdout interface
+    # ------------------------------------------------------------------
     def write(self, data: str):
         self._stdout.write(data)
         self._file.write(data)
+        if self._tg_enabled and data:
+            self._tg_queue.put(data)
 
     def flush(self):
         self._stdout.flush()
@@ -47,7 +108,6 @@ class _Tee:
 
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "redeem.log")
-sys.stdout = _Tee(LOG_PATH)
 
 from dotenv import load_dotenv
 
@@ -60,6 +120,10 @@ from web3.middleware import ExtraDataToPOAMiddleware
 # CONFIG - Edit these or set environment variables
 # =============================================================================
 PRIVATE_KEY = os.environ.get("POLYGON_PRIVATE_KEY", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+sys.stdout = _Tee(LOG_PATH, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 _alchemy_key = os.environ.get("ALCHEMY_API_KEY", "")
 _default_rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{_alchemy_key}" if _alchemy_key else ""
