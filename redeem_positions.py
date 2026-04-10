@@ -453,54 +453,82 @@ def discover_condition_ids_from_logs(w3: Web3, wallet_address: str, ctf_contract
 
 def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
     """
-    Use Polymarket's Gamma API to look up condition IDs from token IDs.
-    Returns mapping: condition_id_hex -> {token_id_yes, token_id_no, market_slug}
+    Resolve token IDs → condition IDs + market info.
+
+    Strategy (in order):
+    1. CLOB positions API  — single call, returns all positions for the address.
+    2. Gamma API batch     — query up to 20 token IDs per request to avoid rate limits.
     """
     import requests
-    
+
     conditions = {}
-    
-    # Query Gamma API for market info by token ID
-    for token_id in token_ids:
+
+    # ----------------------------------------------------------------
+    # Method 1: CLOB positions API (one call for everything)
+    # ----------------------------------------------------------------
+    clob_address = POLYMARKET_PROXY_ADDRESS or ""
+    if clob_address:
         try:
             resp = requests.get(
-                f"https://gamma-api.polymarket.com/markets",
-                params={"clob_token_ids": str(token_id)},
-                timeout=10,
+                "https://clob.polymarket.com/positions",
+                params={"user": clob_address},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                positions = data if isinstance(data, list) else data.get("data", [])
+                for pos in positions:
+                    cid = pos.get("conditionId") or pos.get("condition_id", "")
+                    if not cid:
+                        continue
+                    conditions[cid] = {
+                        "question": pos.get("question") or pos.get("title", f"Condition {cid[:16]}..."),
+                        "outcome": pos.get("outcome", ""),
+                        "resolved": pos.get("resolved", False),
+                    }
+                if conditions:
+                    print(f"  Found {len(conditions)} conditions via CLOB positions API")
+                    return conditions
+                else:
+                    print("  CLOB positions API returned no positions, falling back to Gamma API")
+        except Exception as e:
+            print(f"  CLOB positions API error: {e}")
+
+    # ----------------------------------------------------------------
+    # Method 2: Gamma API — batch up to 20 token IDs per request
+    # ----------------------------------------------------------------
+    token_list = list(token_ids)
+    batch_size = 20
+    for i in range(0, len(token_list), batch_size):
+        batch = token_list[i:i + batch_size]
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/markets",
+                params={"clob_token_ids": ",".join(str(t) for t in batch)},
+                timeout=15,
             )
             if resp.status_code == 200:
                 markets = resp.json()
                 for market in markets:
                     cid = market.get("conditionId") or market.get("condition_id", "")
-                    if cid:
-                        tokens = market.get("tokens", [])
-                        yes_token = None
-                        no_token = None
-                        for t in tokens:
-                            if t.get("outcome", "").lower() == "yes":
-                                yes_token = t.get("token_id", "")
-                            elif t.get("outcome", "").lower() == "no":
-                                no_token = t.get("token_id", "")
-                        
-                        # For Up/Down markets
-                        if not yes_token:
-                            for t in tokens:
-                                if t.get("outcome", "").lower() == "up":
-                                    yes_token = t.get("token_id", "")
-                                elif t.get("outcome", "").lower() == "down":
-                                    no_token = t.get("token_id", "")
-                        
-                        conditions[cid] = {
-                            "question": market.get("question", "Unknown"),
-                            "yes_token": yes_token,
-                            "no_token": no_token,
-                            "outcome": market.get("outcome", ""),
-                            "resolved": market.get("closed", False),
-                        }
-            time.sleep(0.2)  # Rate limit
-        except Exception as e:
+                    if not cid:
+                        continue
+                    tokens = market.get("tokens", [])
+                    yes_token = next((t.get("token_id") for t in tokens
+                                      if t.get("outcome", "").lower() in ("yes", "up")), None)
+                    no_token  = next((t.get("token_id") for t in tokens
+                                      if t.get("outcome", "").lower() in ("no", "down")), None)
+                    conditions[cid] = {
+                        "question": market.get("question", "Unknown"),
+                        "yes_token": yes_token,
+                        "no_token": no_token,
+                        "outcome": market.get("outcome", ""),
+                        "resolved": market.get("closed", False),
+                    }
+            time.sleep(1.0)  # Respect Gamma API rate limit between batches
+        except Exception:
             continue
-    
+
     return conditions
 
 
