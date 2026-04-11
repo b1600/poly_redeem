@@ -451,53 +451,53 @@ def discover_condition_ids_from_logs(w3: Web3, wallet_address: str, ctf_contract
     return condition_ids, set()
 
 
-def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
+def discover_condition_ids_from_gamma_api(token_ids: set, eoa_address: str = "") -> dict:
     """
     Resolve token IDs → condition IDs + market info.
 
     Strategy (in order):
-    1. CLOB positions API  — single call, returns all positions for the address.
-    2. Gamma API batch     — query up to 20 token IDs per request to avoid rate limits.
+    1. Polymarket Data API — single call using EOA address, returns all current positions.
+    2. Gamma API batch     — query up to 20 token IDs per request as fallback.
     """
     import requests
 
     conditions = {}
 
     # ----------------------------------------------------------------
-    # Method 1: CLOB positions API (one call for everything)
+    # Method 1: Polymarket Data API (one call for everything)
     # ----------------------------------------------------------------
-    clob_address = POLYMARKET_PROXY_ADDRESS or ""
-    if clob_address:
+    if eoa_address:
         try:
             resp = requests.get(
-                "https://clob.polymarket.com/positions",
-                params={"user": clob_address},
+                "https://data-api.polymarket.com/positions",
+                params={"user": eoa_address},
                 timeout=15,
             )
-            print(f"  CLOB positions API status: {resp.status_code}")
+            print(f"  Data API status: {resp.status_code}")
             if resp.status_code == 200:
-                data = resp.json()
-                positions = data if isinstance(data, list) else data.get("data", [])
-                print(f"  CLOB positions API raw count: {len(positions)}")
+                positions = resp.json()
+                if not isinstance(positions, list):
+                    positions = positions.get("data", [])
+                print(f"  Data API raw count: {len(positions)}")
                 for pos in positions:
                     cid = pos.get("conditionId") or pos.get("condition_id", "")
                     if not cid:
                         continue
                     conditions[cid] = {
-                        "question": pos.get("question") or pos.get("title", f"Condition {cid[:16]}..."),
+                        "question": pos.get("title") or pos.get("question", f"Condition {cid[:16]}..."),
                         "outcome": pos.get("outcome", ""),
-                        "resolved": pos.get("resolved", False),
+                        "resolved": pos.get("redeemable", False),
                     }
                 if conditions:
-                    print(f"  Found {len(conditions)} conditions via CLOB positions API")
+                    print(f"  Found {len(conditions)} conditions via Data API")
                     return conditions
                 else:
-                    print(f"  CLOB positions API returned no usable conditions (raw: {str(data)[:200]})")
+                    print(f"  Data API returned no usable conditions (raw: {str(positions)[:200]})")
                     print("  Falling back to Gamma API...")
             else:
-                print(f"  CLOB positions API error response: {resp.text[:200]}")
+                print(f"  Data API error response: {resp.text[:200]}")
         except Exception as e:
-            print(f"  CLOB positions API error: {e}")
+            print(f"  Data API error: {e}")
 
     # ----------------------------------------------------------------
     # Method 2: Gamma API — batch up to 20 token IDs per request
@@ -509,29 +509,32 @@ def discover_condition_ids_from_gamma_api(token_ids: set) -> dict:
         try:
             resp = requests.get(
                 "https://gamma-api.polymarket.com/markets",
-                params={"clob_token_ids": ",".join(str(t) for t in batch)},
+                params={"clobTokenIds": ",".join(str(t) for t in batch)},
                 timeout=15,
             )
             if resp.status_code == 200:
                 markets = resp.json()
+                batch_set = set(str(t) for t in batch)
                 for market in markets:
+                    # Only include markets whose clobTokenIds intersect our batch
+                    raw_ids = market.get("clobTokenIds", "[]")
+                    try:
+                        market_token_ids = set(json.loads(raw_ids)) if isinstance(raw_ids, str) else set(str(t) for t in raw_ids)
+                    except Exception:
+                        market_token_ids = set()
+                    if not market_token_ids.intersection(batch_set):
+                        continue
                     cid = market.get("conditionId") or market.get("condition_id", "")
                     if not cid:
                         continue
-                    tokens = market.get("tokens", [])
-                    yes_token = next((t.get("token_id") for t in tokens
-                                      if t.get("outcome", "").lower() in ("yes", "up")), None)
-                    no_token  = next((t.get("token_id") for t in tokens
-                                      if t.get("outcome", "").lower() in ("no", "down")), None)
                     conditions[cid] = {
                         "question": market.get("question", "Unknown"),
-                        "yes_token": yes_token,
-                        "no_token": no_token,
                         "outcome": market.get("outcome", ""),
                         "resolved": market.get("closed", False),
                     }
             time.sleep(1.0)  # Respect Gamma API rate limit between batches
-        except Exception:
+        except Exception as e:
+            print(f"  Gamma API batch error: {e}")
             continue
 
     return conditions
@@ -723,11 +726,11 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
         w3, holder, ctf_contract
     )
 
-    print("\nLooking up market info from Gamma API...")
+    print("\nLooking up market info from Data API...")
     conditions_from_gamma = {}
     if token_ids:
-        conditions_from_gamma = discover_condition_ids_from_gamma_api(token_ids)
-        print(f"  Found {len(conditions_from_gamma)} unique conditions from Gamma API")
+        conditions_from_gamma = discover_condition_ids_from_gamma_api(token_ids, eoa_address)
+        print(f"  Found {len(conditions_from_gamma)} unique conditions from Data API")
 
     all_condition_ids = {}
 
