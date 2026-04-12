@@ -482,6 +482,7 @@ def discover_condition_ids_from_gamma_api(token_ids: set, eoa_address: str = "")
                 for pos in positions:
                     cid = pos.get("conditionId") or pos.get("condition_id", "")
                     if not cid:
+                        print(f"  ⚠️  Skipping position with no conditionId: {str(pos)[:200]}")
                         continue
                     conditions[cid] = {
                         "question": pos.get("title") or pos.get("question", f"Condition {cid[:16]}..."),
@@ -490,10 +491,11 @@ def discover_condition_ids_from_gamma_api(token_ids: set, eoa_address: str = "")
                     }
                 if conditions:
                     print(f"  Found {len(conditions)} conditions via Data API")
-                    return conditions
+                    # Fall through to Gamma API to catch positions the Data API
+                    # returned without a conditionId (they'd be skipped above).
                 else:
                     print(f"  Data API returned no usable conditions (raw: {str(positions)[:200]})")
-                    print("  Falling back to Gamma API...")
+                print("  Supplementing with Gamma API batch lookup for remaining token IDs...")
             else:
                 print(f"  Data API error response: {resp.text[:200]}")
         except Exception as e:
