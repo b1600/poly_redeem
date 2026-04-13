@@ -134,6 +134,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Find yours at: https://polygonscan.com/address/<your_eoa>#tokentxns
 POLYMARKET_PROXY_ADDRESS = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
 
+# Target event — only claim winnings from this event.
+EVENT_SLUG = "btc-updown-5m-1776122400"
+
 sys.stdout = _Tee(LOG_PATH, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
 _alchemy_key = os.environ.get("ALCHEMY_API_KEY", "")
@@ -150,9 +153,6 @@ PARENT_COLLECTION_ID = bytes(32)
 # Polymarket binary markets use index sets [1, 2] (outcome 0 and outcome 1)
 INDEX_SETS = [1, 2]
 
-# PolygonScan API (free tier, no key needed for basic queries)
-POLYGONSCAN_API_URL = "https://api.polygonscan.com/api"
-POLYGONSCAN_API_KEY = os.environ.get("POLYGONSCAN_API_KEY", "")  # Optional, higher rate limits
 
 # =============================================================================
 # ABIs
@@ -291,253 +291,45 @@ def get_collection_id(parent_collection_id: bytes, condition_id: bytes, index_se
     return Web3.keccak(encoded)
 
 
-def discover_condition_ids_from_logs(w3: Web3, wallet_address: str, ctf_contract) -> set:
+def fetch_btc_event_conditions(event_slug: str) -> dict:
     """
-    Discover condition IDs by scanning PositionSplit events and PolygonScan ERC-1155 transfers.
-    Uses PolygonScan as the primary (full-history) source, with on-chain log scan as fallback.
+    Fetch all market condition IDs for the given Polymarket event slug directly
+    from the Gamma API.  Returns {conditionId_hex: {question, outcome, resolved}}.
     """
     import requests as _req
 
-    condition_ids = set()
-    wallet_lower = wallet_address.lower()
-
-    print("Scanning for your positions...")
-
-    # Method 1: Alchemy getAssetTransfers — full history, no block range limit
-    alchemy_key = os.environ.get("ALCHEMY_API_KEY", "")
-    if alchemy_key and alchemy_key in RPC_URL:
-        try:
-            token_ids_received = set()
-            page_key = None
-            while True:
-                params_inner = {
-                    "toAddress": wallet_address,
-                    "contractAddresses": [CTF_ADDRESS],
-                    "category": ["erc1155"],
-                    "withMetadata": False,
-                    "excludeZeroValue": True,
-                    "maxCount": "0x3e8",
-                }
-                if page_key:
-                    params_inner["pageKey"] = page_key
-                payload = {"jsonrpc": "2.0", "id": 1,
-                           "method": "alchemy_getAssetTransfers", "params": [params_inner]}
-                resp = _req.post(RPC_URL, json=payload, timeout=15)
-                resp.raise_for_status()
-                result = resp.json().get("result", {})
-                for transfer in result.get("transfers", []):
-                    for meta in transfer.get("erc1155Metadata") or []:
-                        tid_hex = meta.get("tokenId", "")
-                        if tid_hex:
-                            token_ids_received.add(int(tid_hex, 16))
-                page_key = result.get("pageKey")
-                if not page_key:
-                    break
-
-            print(f"  Found {len(token_ids_received)} unique token IDs via Alchemy API")
-            return condition_ids, token_ids_received
-        except Exception as e:
-            print(f"  Alchemy getAssetTransfers error: {e}")
-
-    # Method 1b: PolygonScan API — full history fallback
-    if POLYGONSCAN_API_KEY:
-        try:
-            params = {
-                "module": "account",
-                "action": "token1155tx",
-                "address": wallet_address,
-                "contractaddress": CTF_ADDRESS,
-                "sort": "desc",
-                "apikey": POLYGONSCAN_API_KEY,
-            }
-            resp = _req.get(POLYGONSCAN_API_URL, params=params, timeout=30)
-            data = resp.json()
-
-            if data.get("status") == "1" and data.get("result"):
-                token_ids_received = set()
-                for tx in data["result"]:
-                    if tx.get("to", "").lower() == wallet_lower:
-                        token_id = int(tx.get("tokenID", "0"))
-                        if token_id > 0:
-                            token_ids_received.add(token_id)
-
-                print(f"  Found {len(token_ids_received)} unique token IDs via PolygonScan API")
-                return condition_ids, token_ids_received
-            else:
-                print(f"  PolygonScan returned no results: {data.get('message')}")
-        except Exception as e:
-            print(f"  PolygonScan API error: {e}")
-
-    # Method 2: On-chain eth_getLogs via a public RPC (supports larger block ranges)
-    FALLBACK_RPC_URLS = [
-        "https://polygon-bor-rpc.publicnode.com",
-        "https://rpc.ankr.com/polygon",
-        "https://polygon-rpc.com",
-    ]
-    print("  Falling back to on-chain log scan via public RPC...")
-    latest_block = w3.eth.block_number
-    from_block = max(0, latest_block - 500_000)
-
-    split_event_sig = "0x" + Web3.keccak(text="PositionSplit(address,address,bytes32,bytes32,uint256[],uint256)").hex()
-    wallet_topic = "0x" + wallet_address[2:].lower().zfill(64)
-
-    # Pick the first public RPC that responds and supports 2000-block ranges
-    rpc_url = None
-    chunk_size = 2_000
-    for candidate in FALLBACK_RPC_URLS:
-        try:
-            probe_payload = {
-                "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                "params": [{"address": CTF_ADDRESS, "topics": [split_event_sig],
-                            "fromBlock": hex(latest_block - chunk_size), "toBlock": hex(latest_block)}]
-            }
-            probe = _req.post(candidate, json=probe_payload, timeout=10)
-            body = probe.json()
-            if "error" not in body:
-                rpc_url = candidate
-                print(f"  Using public RPC: {candidate}")
-                break
-            else:
-                msg = body["error"].get("message", "")
-                import re
-                match = re.search(r'\[0x[0-9a-f]+, (0x[0-9a-f]+)\]', msg)
-                if match:
-                    suggested_end = int(match.group(1), 16)
-                    detected_chunk = suggested_end - (latest_block - chunk_size)
-                    if detected_chunk >= 100:
-                        chunk_size = detected_chunk
-                        rpc_url = candidate
-                        print(f"  Using public RPC: {candidate} (max {chunk_size} blocks/request)")
-                        break
-        except Exception:
-            continue
-
-    if not rpc_url:
-        print("  No suitable public RPC found — add POLYGONSCAN_API_KEY for full history")
-        return condition_ids, set()
-
-    found_splits = 0
-    total_blocks = latest_block - from_block
-    total_chunks = total_blocks // chunk_size + 1
-
-    if total_chunks > 5_000:
-        print(f"  Log scan would require {total_chunks:,} calls — skipping (add POLYGONSCAN_API_KEY for full history)")
-        return condition_ids, set()
-
-    try:
-        for i, chunk_start in enumerate(range(from_block, latest_block + 1, chunk_size)):
-            chunk_end = min(chunk_start + chunk_size - 1, latest_block)
-            payload = {
-                "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                "params": [{"address": CTF_ADDRESS,
-                            "topics": [split_event_sig, wallet_topic],
-                            "fromBlock": hex(chunk_start), "toBlock": hex(chunk_end)}]
-            }
-            resp = _req.post(rpc_url, json=payload, timeout=10)
-            result = resp.json().get("result", [])
-            for log in result:
-                topics = log.get("topics", [])
-                if len(topics) >= 4:
-                    cid = bytes.fromhex(topics[3][2:])
-                    condition_ids.add(cid)
-                    found_splits += 1
-                    print(f"  Found condition: 0x{cid.hex()[:16]}...")
-            if (i + 1) % 100 == 0:
-                print(f"  Scanned {i + 1}/{total_chunks} chunks...")
-        print(f"  Log scan complete ({found_splits} events found)")
-    except Exception as e:
-        print(f"  Log scan error: {e}")
-
-    return condition_ids, set()
-
-
-def discover_condition_ids_from_gamma_api(token_ids: set, eoa_address: str = "") -> dict:
-    """
-    Resolve token IDs → condition IDs + market info.
-
-    Strategy (in order):
-    1. Polymarket Data API — single call using EOA address, returns all current positions.
-    2. Gamma API batch     — query up to 20 token IDs per request as fallback.
-    """
-    import requests
-
     conditions = {}
+    try:
+        resp = _req.get(
+            "https://gamma-api.polymarket.com/events",
+            params={"slug": event_slug},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"  ❌ Gamma API error: {resp.status_code} {resp.text[:200]}")
+            return conditions
 
-    # ----------------------------------------------------------------
-    # Method 1: Polymarket Data API (one call for everything)
-    # ----------------------------------------------------------------
-    if eoa_address:
-        try:
-            resp = requests.get(
-                "https://data-api.polymarket.com/positions",
-                params={"user": eoa_address},
-                timeout=15,
-            )
-            print(f"  Data API status: {resp.status_code}")
-            if resp.status_code == 200:
-                positions = resp.json()
-                if not isinstance(positions, list):
-                    positions = positions.get("data", [])
-                print(f"  Data API raw count: {len(positions)}")
-                for pos in positions:
-                    cid = pos.get("conditionId") or pos.get("condition_id", "")
-                    if not cid:
-                        print(f"  ⚠️  Skipping position with no conditionId: {str(pos)[:200]}")
-                        continue
-                    conditions[cid] = {
-                        "question": pos.get("title") or pos.get("question", f"Condition {cid[:16]}..."),
-                        "outcome": pos.get("outcome", ""),
-                        "resolved": pos.get("redeemable", False),
-                    }
-                if conditions:
-                    print(f"  Found {len(conditions)} conditions via Data API")
-                    # Fall through to Gamma API to catch positions the Data API
-                    # returned without a conditionId (they'd be skipped above).
-                else:
-                    print(f"  Data API returned no usable conditions (raw: {str(positions)[:200]})")
-                print("  Supplementing with Gamma API batch lookup for remaining token IDs...")
-            else:
-                print(f"  Data API error response: {resp.text[:200]}")
-        except Exception as e:
-            print(f"  Data API error: {e}")
+        events = resp.json()
+        if not events:
+            print(f"  ❌ No event found for slug: {event_slug}")
+            return conditions
 
-    # ----------------------------------------------------------------
-    # Method 2: Gamma API — batch up to 20 token IDs per request
-    # ----------------------------------------------------------------
-    token_list = list(token_ids)
-    batch_size = 20
-    for i in range(0, len(token_list), batch_size):
-        batch = token_list[i:i + batch_size]
-        try:
-            resp = requests.get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"clobTokenIds": ",".join(str(t) for t in batch)},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                markets = resp.json()
-                batch_set = set(str(t) for t in batch)
-                for market in markets:
-                    # Only include markets whose clobTokenIds intersect our batch
-                    raw_ids = market.get("clobTokenIds", "[]")
-                    try:
-                        market_token_ids = set(json.loads(raw_ids)) if isinstance(raw_ids, str) else set(str(t) for t in raw_ids)
-                    except Exception:
-                        market_token_ids = set()
-                    if not market_token_ids.intersection(batch_set):
-                        continue
-                    cid = market.get("conditionId") or market.get("condition_id", "")
-                    if not cid:
-                        continue
-                    conditions[cid] = {
-                        "question": market.get("question", "Unknown"),
-                        "outcome": market.get("outcome", ""),
-                        "resolved": market.get("closed", False),
-                    }
-            time.sleep(1.0)  # Respect Gamma API rate limit between batches
-        except Exception as e:
-            print(f"  Gamma API batch error: {e}")
-            continue
+        event = events[0] if isinstance(events, list) else events
+        markets = event.get("markets", [])
+        print(f"  Found {len(markets)} markets in event")
+
+        for market in markets:
+            cid = market.get("conditionId") or market.get("condition_id", "")
+            if not cid:
+                continue
+            cid_clean = cid.replace("0x", "")
+            conditions[cid_clean] = {
+                "question": market.get("question", "BTC Up/Down 5m"),
+                "outcome": market.get("outcome", ""),
+                "resolved": market.get("closed", False),
+            }
+    except Exception as e:
+        print(f"  ❌ Error fetching event conditions: {e}")
 
     return conditions
 
@@ -719,38 +511,16 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
                          proxy_address, proxy_contract)
         return
 
-    # Discover positions — scan the holder address (proxy or EOA)
+    # Fetch all markets for the target BTC Up/Down 5m event
     print("\n" + "=" * 60)
-    print("PHASE 1: Discovering your positions")
+    print(f"PHASE 1: Fetching markets for '{EVENT_SLUG}'")
     print("=" * 60)
 
-    condition_ids_from_events, token_ids = discover_condition_ids_from_logs(
-        w3, holder, ctf_contract
-    )
-
-    print("\nLooking up market info from Data API...")
-    conditions_from_gamma = {}
-    if token_ids:
-        conditions_from_gamma = discover_condition_ids_from_gamma_api(token_ids, eoa_address)
-        print(f"  Found {len(conditions_from_gamma)} unique conditions from Data API")
-
-    all_condition_ids = {}
-
-    for cid_bytes in condition_ids_from_events:
-        cid_hex = cid_bytes.hex()
-        all_condition_ids[cid_hex] = {"question": f"Condition 0x{cid_hex[:16]}..."}
-
-    for cid_hex, info in conditions_from_gamma.items():
-        cid_hex_clean = cid_hex.replace("0x", "")
-        all_condition_ids[cid_hex_clean] = info
+    all_condition_ids = fetch_btc_event_conditions(EVENT_SLUG)
 
     if not all_condition_ids:
-        print("\n⚠️  No positions found. This could mean:")
-        print("   - No trades in the scanned block range")
-        print("   - PolygonScan API rate limited (try adding POLYGONSCAN_API_KEY)")
-        print("   - Try passing --condition-id directly if you know the condition")
-        print(f"\n   You can also manually check your tokens at:")
-        print(f"   https://polygonscan.com/token/{CTF_ADDRESS}?a={holder}")
+        print(f"\n⚠️  No conditions found for event '{EVENT_SLUG}'.")
+        print("   Check if the event slug is correct or the Gamma API is reachable.")
         return
 
     print(f"\n{'=' * 60}")
@@ -804,7 +574,6 @@ def main():
     parser = argparse.ArgumentParser(description="Redeem Polymarket winning positions")
     parser.add_argument("--execute", action="store_true", help="Actually send redemption transactions")
     parser.add_argument("--condition-id", type=str, help="Redeem a specific condition ID (hex)")
-    parser.add_argument("--blocks", type=int, default=500_000, help="Number of blocks to scan back (default: 500000)")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit (default: loop every 10 min)")
     args = parser.parse_args()
 
