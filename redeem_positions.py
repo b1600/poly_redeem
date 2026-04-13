@@ -134,8 +134,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Find yours at: https://polygonscan.com/address/<your_eoa>#tokentxns
 POLYMARKET_PROXY_ADDRESS = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
 
-# Target event — only claim winnings from this event.
-EVENT_SLUG = "btc-updown-5m-1776122400"
+# Slug prefix shared by every BTC Up/Down 5-minute event on Polymarket.
+MARKET_SLUG_PREFIX = "btc-updown-5m"
 
 sys.stdout = _Tee(LOG_PATH, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -291,45 +291,111 @@ def get_collection_id(parent_collection_id: bytes, condition_id: bytes, index_se
     return Web3.keccak(encoded)
 
 
-def fetch_btc_event_conditions(event_slug: str) -> dict:
+def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
     """
-    Fetch all market condition IDs for the given Polymarket event slug directly
-    from the Gamma API.  Returns {conditionId_hex: {question, outcome, resolved}}.
+    Discover ALL BTC Up/Down 5-minute market conditions the wallet has positions in,
+    across every time frame.
+
+    Method 1 — Data API with proxy address: the proxy holds the actual CTF tokens,
+                so the Data API should return all on-chain positions for it.
+    Method 2 — Data API with EOA address: catches any positions indexed by the
+                signing key in the CLOB order book.
+    Method 3 — Gamma API paginated event search: walks through closed events and
+                collects any whose slug starts with 'btc-updown-5m'.
+
+    Returns {conditionId_hex: {question, outcome, resolved}}.
     """
-    import requests as _req
+    import requests
 
     conditions = {}
-    try:
-        resp = _req.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"slug": event_slug},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            print(f"  ❌ Gamma API error: {resp.status_code} {resp.text[:200]}")
-            return conditions
 
-        events = resp.json()
-        if not events:
-            print(f"  ❌ No event found for slug: {event_slug}")
-            return conditions
-
-        event = events[0] if isinstance(events, list) else events
-        markets = event.get("markets", [])
-        print(f"  Found {len(markets)} markets in event")
-
-        for market in markets:
-            cid = market.get("conditionId") or market.get("condition_id", "")
-            if not cid:
+    # ── Methods 1 & 2: Data API ──────────────────────────────────────────────
+    for label, addr in [("proxy", proxy_address), ("EOA", eoa_address)]:
+        if not addr:
+            continue
+        try:
+            resp = requests.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": addr},
+                timeout=15,
+            )
+            print(f"  Data API [{label}]: HTTP {resp.status_code}")
+            if resp.status_code != 200:
                 continue
-            cid_clean = cid.replace("0x", "")
-            conditions[cid_clean] = {
-                "question": market.get("question", "BTC Up/Down 5m"),
-                "outcome": market.get("outcome", ""),
-                "resolved": market.get("closed", False),
-            }
-    except Exception as e:
-        print(f"  ❌ Error fetching event conditions: {e}")
+            positions = resp.json()
+            if not isinstance(positions, list):
+                positions = positions.get("data", [])
+            print(f"  Data API [{label}]: {len(positions)} raw positions")
+            before = len(conditions)
+            for pos in positions:
+                cid = pos.get("conditionId") or pos.get("condition_id", "")
+                if not cid:
+                    continue
+                # Identify BTC Up/Down 5m by slug or question keywords
+                slug = (
+                    pos.get("marketSlug") or pos.get("slug") or
+                    pos.get("eventSlug") or pos.get("market_slug") or ""
+                ).lower()
+                title = (pos.get("title") or pos.get("question") or "").lower()
+                is_btc5m = MARKET_SLUG_PREFIX in slug or (
+                    ("btc" in title or "bitcoin" in title) and "5" in title
+                )
+                if not is_btc5m:
+                    continue
+                cid_clean = cid.replace("0x", "")
+                conditions[cid_clean] = {
+                    "question": pos.get("title") or pos.get("question") or f"BTC 5m {cid_clean[:16]}...",
+                    "outcome": pos.get("outcome", ""),
+                    "resolved": pos.get("redeemable", False),
+                }
+            print(f"  Data API [{label}]: {len(conditions) - before} BTC 5m conditions added")
+        except Exception as e:
+            print(f"  Data API [{label}] error: {e}")
+
+    # ── Method 3: Gamma API paginated event search ───────────────────────────
+    # Walk through closed events in pages, keep those with the BTC 5m slug prefix.
+    # Cap at 50 pages (5 000 events) to avoid runaway calls.
+    print("  Searching Gamma API for BTC 5m events...")
+    offset = 0
+    limit = 100
+    gamma_added = 0
+    for _ in range(50):
+        try:
+            resp = requests.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"limit": limit, "offset": offset, "closed": "true"},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                break
+            events = resp.json()
+            if not events:
+                break
+            for event in events:
+                slug = (event.get("slug") or "").lower()
+                if not slug.startswith(MARKET_SLUG_PREFIX):
+                    continue
+                for market in event.get("markets", []):
+                    cid = market.get("conditionId") or market.get("condition_id", "")
+                    if not cid:
+                        continue
+                    cid_clean = cid.replace("0x", "")
+                    if cid_clean not in conditions:
+                        conditions[cid_clean] = {
+                            "question": market.get("question", "BTC Up/Down 5m"),
+                            "outcome": market.get("outcome", ""),
+                            "resolved": market.get("closed", False),
+                        }
+                        gamma_added += 1
+            offset += limit
+            if len(events) < limit:
+                break
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"  Gamma API search error: {e}")
+            break
+    if gamma_added:
+        print(f"  Gamma API search: {gamma_added} additional conditions found")
 
     return conditions
 
@@ -511,16 +577,16 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
                          proxy_address, proxy_contract)
         return
 
-    # Fetch all markets for the target BTC Up/Down 5m event
+    # Discover all BTC Up/Down 5m conditions across every time frame
     print("\n" + "=" * 60)
-    print(f"PHASE 1: Fetching markets for '{EVENT_SLUG}'")
+    print("PHASE 1: Discovering BTC Up/Down 5m positions")
     print("=" * 60)
 
-    all_condition_ids = fetch_btc_event_conditions(EVENT_SLUG)
+    all_condition_ids = fetch_all_btc5m_conditions(proxy_address, eoa_address)
 
     if not all_condition_ids:
-        print(f"\n⚠️  No conditions found for event '{EVENT_SLUG}'.")
-        print("   Check if the event slug is correct or the Gamma API is reachable.")
+        print("\n⚠️  No BTC Up/Down 5m conditions found.")
+        print("   Ensure POLYMARKET_PROXY_ADDRESS is set and the APIs are reachable.")
         return
 
     print(f"\n{'=' * 60}")
