@@ -294,9 +294,9 @@ def get_collection_id(parent_collection_id: bytes, condition_id: bytes, index_se
     return Web3.keccak(encoded)
 
 
-def _get_proxy_token_ids(proxy_address: str) -> set:
+def _get_proxy_token_ids(address: str, label: str = "proxy") -> set:
     """
-    Return the full set of ERC-1155 token IDs held by the proxy wallet
+    Return the full set of ERC-1155 token IDs ever received by *address*
     using Alchemy's getAssetTransfers.  Returns an empty set if no Alchemy
     key is configured.
     """
@@ -311,7 +311,7 @@ def _get_proxy_token_ids(proxy_address: str) -> set:
     try:
         while True:
             params = {
-                "toAddress": proxy_address,
+                "toAddress": address,
                 "contractAddresses": [CTF_ADDRESS],
                 "category": ["erc1155"],
                 "withMetadata": False,
@@ -333,9 +333,9 @@ def _get_proxy_token_ids(proxy_address: str) -> set:
             page_key = result.get("pageKey")
             if not page_key:
                 break
-        print(f"  Alchemy: {len(token_ids)} token IDs in proxy wallet")
+        print(f"  Alchemy: {len(token_ids)} token IDs in {label} wallet")
     except Exception as e:
-        print(f"  Alchemy error: {e}")
+        print(f"  Alchemy error ({label}): {e}")
     return token_ids
 
 
@@ -366,10 +366,15 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
 
     conditions: dict = {}
 
-    # ── Method 1: Alchemy — ground-truth token IDs in proxy ─────────────────
+    # ── Method 1: Alchemy — ground-truth token IDs in proxy AND EOA ─────────
     # unmatched_ids shrinks as we match condition → position IDs.
     # When empty we stop the slug scan early.
-    unmatched_ids: set = _get_proxy_token_ids(proxy_address) if proxy_address else set()
+    # We scan both the proxy and the EOA because CTF tokens may be held by
+    # either address depending on how positions were originally purchased.
+    unmatched_ids: set = set()
+    if proxy_address:
+        unmatched_ids |= _get_proxy_token_ids(proxy_address, "proxy")
+    unmatched_ids |= _get_proxy_token_ids(eoa_address, "EOA")
 
     def _try_add_market(market: dict) -> bool:
         """Add market if its position IDs are in unmatched_ids (or no Alchemy data).
@@ -492,17 +497,13 @@ def check_and_redeem(
     """
     Check if a condition is resolved, if we have winning tokens, and redeem.
 
-    If proxy_address is set:
-      - balances are checked on the proxy (it holds the CTF tokens)
-      - redemption is executed via proxy.execute(CTF, redeemPositions_calldata)
-        so USDC.e lands back in the proxy
-    Otherwise falls back to direct call from the EOA.
+    Checks the proxy wallet first; if it holds no tokens for this condition,
+    falls back to checking the EOA directly.  Redemption is routed through
+    the proxy.execute() call when tokens are in the proxy, or sent directly
+    from the EOA when tokens are held there.
 
     Returns tx hash if redeemed, None otherwise.
     """
-    # The address that actually holds the tokens
-    holder = Web3.to_checksum_address(proxy_address) if proxy_address else eoa_address
-
     condition_id_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
 
     # Check if condition is resolved (payoutDenominator > 0 means resolved)
@@ -529,9 +530,21 @@ def check_and_redeem(
     position_id_0 = get_position_id(USDC_E_ADDRESS, collection_id_0)
     position_id_1 = get_position_id(USDC_E_ADDRESS, collection_id_1)
 
-    # Check balance on the token holder (proxy or EOA)
-    balance_0 = ctf_contract.functions.balanceOf(holder, position_id_0).call()
-    balance_1 = ctf_contract.functions.balanceOf(holder, position_id_1).call()
+    # Determine which address actually holds the tokens: try proxy first, then EOA.
+    use_proxy = False
+    if proxy_address and proxy_contract:
+        proxy_cs = Web3.to_checksum_address(proxy_address)
+        balance_0 = ctf_contract.functions.balanceOf(proxy_cs, position_id_0).call()
+        balance_1 = ctf_contract.functions.balanceOf(proxy_cs, position_id_1).call()
+        if balance_0 > 0 or balance_1 > 0:
+            holder = proxy_cs
+            use_proxy = True
+
+    if not use_proxy:
+        eoa_cs = Web3.to_checksum_address(eoa_address)
+        balance_0 = ctf_contract.functions.balanceOf(eoa_cs, position_id_0).call()
+        balance_1 = ctf_contract.functions.balanceOf(eoa_cs, position_id_1).call()
+        holder = eoa_cs
 
     winning_balance = balance_0 if winning_index == 0 else balance_1
     losing_balance = balance_1 if winning_index == 0 else balance_0
@@ -569,7 +582,7 @@ def check_and_redeem(
             "chainId": 137,
         }
 
-        if proxy_contract and proxy_address:
+        if use_proxy:
             # Encode the redeemPositions call and forward it through the proxy
             redeem_calldata = ctf_contract.encode_abi(
                 "redeemPositions",
@@ -593,6 +606,7 @@ def check_and_redeem(
                 condition_id_bytes,
                 INDEX_SETS,
             ).build_transaction(base)
+            print(f"     📡 Redeeming directly from EOA...")
 
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
