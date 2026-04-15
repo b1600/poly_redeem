@@ -138,7 +138,7 @@ POLYMARKET_PROXY_ADDRESS = os.environ.get("POLYMARKET_PROXY_ADDRESS", "")
 MARKET_SLUG_PREFIX = "btc-updown-5m"
 
 # How many days back to scan for claimable positions via slug enumeration.
-SLUG_LOOKBACK_DAYS = 1
+SLUG_LOOKBACK_SECONDS = 3 * 3600  # 3 hours
 
 sys.stdout = _Tee(LOG_PATH, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -149,6 +149,8 @@ RPC_URL = os.environ.get("POLYGON_RPC_URL", _default_rpc)
 # Contract addresses on Polygon
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens
 USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged)
+NATIVE_USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Native USDC
+COLLATERAL_CANDIDATES = [USDC_E_ADDRESS, NATIVE_USDC_ADDRESS]
 
 # Polymarket uses parentCollectionId = bytes32(0) for all markets
 PARENT_COLLECTION_ID = bytes(32)
@@ -208,6 +210,31 @@ CTF_ABI = json.loads("""[
         "outputs": [{"name": "", "type": "uint256"}],
         "payable": false,
         "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "constant": false,
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"}
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "constant": false,
+        "inputs": [
+            {"name": "from",  "type": "address"},
+            {"name": "to",    "type": "address"},
+            {"name": "id",    "type": "uint256"},
+            {"name": "value", "type": "uint256"},
+            {"name": "data",  "type": "bytes"}
+        ],
+        "name": "safeTransferFrom",
+        "outputs": [],
+        "stateMutability": "nonpayable",
         "type": "function"
     },
     {
@@ -386,15 +413,42 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
         if cid_clean in conditions:
             return False
         if unmatched_ids:
-            pid0, pid1 = _position_ids_for_condition(cid_clean)
-            match = unmatched_ids & {pid0, pid1}
-            if not match:
-                return False
-            unmatched_ids.difference_update(match)
+            # Strategy 1: direct match via 'asset' field (Data API provides the exact
+            # ERC-1155 token ID we already fetched from Alchemy — most reliable).
+            direct_matched: set = set()
+            for asset_field in ("asset", "oppositeAsset"):
+                raw = market.get(asset_field)
+                if raw is not None:
+                    try:
+                        tid = int(raw)
+                        if tid in unmatched_ids:
+                            direct_matched.add(tid)
+                    except (ValueError, TypeError):
+                        pass
+            if direct_matched:
+                unmatched_ids.difference_update(direct_matched)
+            else:
+                # Strategy 2: compute position IDs from condition ID and check
+                pid0, pid1 = _position_ids_for_condition(cid_clean)
+                match = unmatched_ids & {pid0, pid1}
+                if not match:
+                    return False
+                unmatched_ids.difference_update(match)
+        # Store raw asset token IDs so check_and_redeem can use them directly
+        # instead of recomputing (which requires knowing the collateral token).
+        def _to_int(v):
+            try:
+                return int(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
         conditions[cid_clean] = {
             "question": market.get("question") or market.get("title") or "BTC Up/Down 5m",
             "outcome": market.get("outcome", ""),
             "resolved": market.get("closed", False),
+            "asset": _to_int(market.get("asset")),
+            "oppositeAsset": _to_int(market.get("oppositeAsset")),
+            "outcomeIndex": market.get("outcomeIndex"),
         }
         return True
 
@@ -420,33 +474,76 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
                 slug = (pos.get("marketSlug") or pos.get("slug") or
                         pos.get("eventSlug") or pos.get("market_slug") or "").lower()
                 title = (pos.get("title") or pos.get("question") or "").lower()
-                if MARKET_SLUG_PREFIX not in slug and not (
-                    ("btc" in title or "bitcoin" in title) and "5" in title
-                ):
-                    continue
+                # When we have Alchemy token IDs, skip slug/title pre-filter;
+                # _try_add_market will reject non-matching conditions via position ID check.
+                if not unmatched_ids:
+                    if MARKET_SLUG_PREFIX not in slug and not (
+                        ("btc" in title or "bitcoin" in title) and "5" in title
+                    ):
+                        continue
                 _try_add_market(pos)
             print(f"  Data API [{label}]: {len(conditions) - before} BTC 5m conditions matched")
         except Exception as e:
             print(f"  Data API [{label}] error: {e}")
 
+    # ── Method 2b: Gamma API lookup by Alchemy token IDs ────────────────────
+    # The Gamma /markets endpoint accepts clob_token_ids (= ERC-1155 position IDs).
+    # This directly maps the token IDs we know we hold to their condition IDs —
+    # the most reliable approach when slug/title filters fail.
+    if unmatched_ids:
+        print(f"  Gamma token-ID lookup ({len(unmatched_ids)} IDs)...")
+        token_added = 0
+        # Query in batches of 20 to stay within URL length limits
+        id_list = list(unmatched_ids)
+        batch_size = 20
+        for i in range(0, len(id_list), batch_size):
+            batch = id_list[i:i + batch_size]
+            try:
+                resp = requests.get(
+                    "https://gamma-api.polymarket.com/markets",
+                    params={"clob_token_ids": ",".join(str(tid) for tid in batch)},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    items = resp.json()
+                    if not isinstance(items, list):
+                        items = items.get("data", [])
+                    for market in items:
+                        if _try_add_market(market):
+                            token_added += 1
+            except Exception as e:
+                print(f"  Gamma token-ID lookup error: {e}")
+        if token_added:
+            print(f"  Gamma token-ID lookup: {token_added} conditions added")
+
     # ── Method 3: Gamma API title search ────────────────────────────────────
     print("  Gamma title search for 'Bitcoin Up or Down'...")
     gamma_title_added = 0
-    try:
-        resp = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"q": "Bitcoin Up or Down", "limit": 500, "closed": "true"},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            for event in resp.json():
-                if not (event.get("slug") or "").lower().startswith(MARKET_SLUG_PREFIX):
-                    continue
-                for market in event.get("markets", []):
+    # Search both events and markets endpoints; omit 'closed' filter so recently
+    # resolved markets (not yet fully settled in the API) are also returned.
+    for gamma_url, result_key in [
+        ("https://gamma-api.polymarket.com/events", None),
+        ("https://gamma-api.polymarket.com/markets", None),
+    ]:
+        try:
+            resp = requests.get(
+                gamma_url,
+                params={"q": "Bitcoin Up or Down", "limit": 500},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+            items = resp.json()
+            if not isinstance(items, list):
+                items = items.get("data", [])
+            for item in items:
+                # Events have nested markets; markets are top-level
+                markets = item.get("markets") if "markets" in item else [item]
+                for market in markets:
                     if _try_add_market(market):
                         gamma_title_added += 1
-    except Exception as e:
-        print(f"  Gamma title search error: {e}")
+        except Exception as e:
+            print(f"  Gamma title search error ({gamma_url}): {e}")
     if gamma_title_added:
         print(f"  Gamma title search: {gamma_title_added} conditions added")
 
@@ -454,10 +551,10 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
     # Only run if Alchemy found token IDs and some are still unmatched.
     if unmatched_ids:
         now_ts = int(time.time())
-        cutoff_ts = now_ts - SLUG_LOOKBACK_DAYS * 86400
+        cutoff_ts = now_ts - SLUG_LOOKBACK_SECONDS
         # Round to 5-minute boundary and scan backwards
         start_ts = (now_ts // 300) * 300
-        print(f"  Gamma slug scan backwards ({SLUG_LOOKBACK_DAYS} days, "
+        print(f"  Gamma slug scan backwards ({SLUG_LOOKBACK_SECONDS // 3600}h, "
               f"{len(unmatched_ids)} token IDs still unmatched)...")
         slug_added = 0
         for ts in range(start_ts, cutoff_ts, -300):
@@ -465,16 +562,21 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
                 break  # all proxy token IDs matched
             slug = f"{MARKET_SLUG_PREFIX}-{ts}"
             try:
-                resp = requests.get(
+                # Try both the events and markets Gamma endpoints for each slug
+                for gamma_url in [
                     "https://gamma-api.polymarket.com/events",
-                    params={"slug": slug},
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    for event in resp.json():
-                        for market in event.get("markets", []):
-                            if _try_add_market(market):
-                                slug_added += 1
+                    "https://gamma-api.polymarket.com/markets",
+                ]:
+                    resp = requests.get(gamma_url, params={"slug": slug}, timeout=5)
+                    if resp.status_code == 200:
+                        items = resp.json()
+                        if not isinstance(items, list):
+                            items = items.get("data", [])
+                        for item in items:
+                            markets = item.get("markets") if "markets" in item else [item]
+                            for market in markets:
+                                if _try_add_market(market):
+                                    slug_added += 1
                 time.sleep(0.05)
             except Exception:
                 pass
@@ -523,12 +625,39 @@ def check_and_redeem(
     winning_index = 0 if payout_0 > 0 else 1
     winning_label = "Yes/Up" if winning_index == 0 else "No/Down"
 
-    # Compute position IDs for both outcomes
-    collection_id_0 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 1)  # indexSet=1 -> outcome 0
-    collection_id_1 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 2)  # indexSet=2 -> outcome 1
+    # Resolve position IDs and collateral token.
+    # Prefer stored asset/oppositeAsset from the Data API (exact values) over
+    # recomputing, because newer markets may use native USDC instead of USDC.e.
+    stored_asset = market_info.get("asset")
+    stored_opposite = market_info.get("oppositeAsset")
+    stored_outcome_idx = market_info.get("outcomeIndex")
 
-    position_id_0 = get_position_id(USDC_E_ADDRESS, collection_id_0)
-    position_id_1 = get_position_id(USDC_E_ADDRESS, collection_id_1)
+    if stored_asset is not None and stored_opposite is not None and stored_outcome_idx is not None:
+        if int(stored_outcome_idx) == 0:
+            position_id_0, position_id_1 = int(stored_asset), int(stored_opposite)
+        else:
+            position_id_0, position_id_1 = int(stored_opposite), int(stored_asset)
+    else:
+        # Fall back to computing — try every collateral candidate until non-zero balance found
+        position_id_0 = position_id_1 = None
+
+    # Auto-detect collateral token: the one whose computed position IDs match
+    # the known position IDs (works for both USDC.e and native USDC markets).
+    collateral_token = USDC_E_ADDRESS  # default
+    col0 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 1)
+    col1 = get_collection_id(PARENT_COLLECTION_ID, condition_id_bytes, 2)
+    for candidate in COLLATERAL_CANDIDATES:
+        if position_id_0 is not None:
+            # Verify the candidate matches the known position IDs
+            if get_position_id(candidate, col0) == position_id_0:
+                collateral_token = candidate
+                break
+        else:
+            # No stored IDs — use computed ones for this candidate
+            position_id_0 = get_position_id(candidate, col0)
+            position_id_1 = get_position_id(candidate, col1)
+            collateral_token = candidate
+            break  # will re-check via balance below
 
     # Determine which address actually holds the tokens: try proxy first, then EOA.
     use_proxy = False
@@ -544,6 +673,20 @@ def check_and_redeem(
         eoa_cs = Web3.to_checksum_address(eoa_address)
         balance_0 = ctf_contract.functions.balanceOf(eoa_cs, position_id_0).call()
         balance_1 = ctf_contract.functions.balanceOf(eoa_cs, position_id_1).call()
+        # If still zero and we guessed the collateral token, try the other candidate
+        if balance_0 == 0 and balance_1 == 0 and stored_asset is None:
+            for candidate in COLLATERAL_CANDIDATES:
+                if candidate == collateral_token:
+                    continue
+                alt_pid0 = get_position_id(candidate, col0)
+                alt_pid1 = get_position_id(candidate, col1)
+                b0 = ctf_contract.functions.balanceOf(eoa_cs, alt_pid0).call()
+                b1 = ctf_contract.functions.balanceOf(eoa_cs, alt_pid1).call()
+                if b0 > 0 or b1 > 0:
+                    position_id_0, position_id_1 = alt_pid0, alt_pid1
+                    balance_0, balance_1 = b0, b1
+                    collateral_token = candidate
+                    break
         holder = eoa_cs
 
     winning_balance = balance_0 if winning_index == 0 else balance_1
@@ -569,6 +712,31 @@ def check_and_redeem(
         print(f"     🔍 DRY RUN — would redeem {winning_balance:,} winning tokens")
         return "DRY_RUN"
 
+    # Start with the auto-detected candidate, then fall back to the other
+    candidates_ordered = [collateral_token] + [
+        c for c in COLLATERAL_CANDIDATES if c != collateral_token
+    ]
+
+    # ── Helper: build and simulate a call cheaply (no gas/nonce overhead) ────
+    def _eth_call(from_addr: str, to_addr: str, data: bytes) -> bool:
+        try:
+            w3.eth.call({"from": from_addr, "to": to_addr, "data": data})
+            return True
+        except Exception:
+            return False
+
+    def _redeem_calldata(ctoken: str) -> bytes:
+        return ctf_contract.encode_abi(
+            "redeemPositions",
+            args=[Web3.to_checksum_address(ctoken), PARENT_COLLECTION_ID, condition_id_bytes, INDEX_SETS],
+        )
+
+    def _proxy_execute_data(inner_data: bytes) -> bytes:
+        return proxy_contract.encode_abi(
+            "execute",
+            args=[Web3.to_checksum_address(CTF_ADDRESS), 0, inner_data],
+        )
+
     # Execute redemption
     print(f"     🔄 Redeeming...")
     try:
@@ -582,31 +750,197 @@ def check_and_redeem(
             "chainId": 137,
         }
 
+        # ── Strategy 1: proxy.execute() → CTF.redeemPositions ───────────────
+        working_collateral = None
         if use_proxy:
-            # Encode the redeemPositions call and forward it through the proxy
-            redeem_calldata = ctf_contract.encode_abi(
-                "redeemPositions",
-                args=[
-                    Web3.to_checksum_address(USDC_E_ADDRESS),
-                    PARENT_COLLECTION_ID,
-                    condition_id_bytes,
-                    INDEX_SETS,
-                ],
-            )
-            tx = proxy_contract.functions.execute(
-                Web3.to_checksum_address(CTF_ADDRESS),
-                0,
-                redeem_calldata,
-            ).build_transaction(base)
-            print(f"     📡 Routing through proxy: {proxy_address[:10]}...")
+            for candidate in candidates_ordered:
+                data = _proxy_execute_data(_redeem_calldata(candidate))
+                if _eth_call(eoa_address, proxy_address, data):
+                    working_collateral = candidate
+                    break
+                print(f"     ⚠️  proxy.execute() sim failed for collateral {candidate[:10]}...")
+
         else:
-            tx = ctf_contract.functions.redeemPositions(
-                Web3.to_checksum_address(USDC_E_ADDRESS),
-                PARENT_COLLECTION_ID,
-                condition_id_bytes,
-                INDEX_SETS,
+            for candidate in candidates_ordered:
+                data = _redeem_calldata(candidate)
+                if _eth_call(eoa_address, CTF_ADDRESS, data):
+                    working_collateral = candidate
+                    break
+                print(f"     ⚠️  Direct redeem sim failed for collateral {candidate[:10]}...")
+
+        # ── Strategy 2 (proxy only): approve EOA → transfer tokens → redeem ─
+        # Used when proxy.execute(redeemPositions) fails but direct CTF works.
+        use_transfer_strategy = False
+        _safe_exec_ctx = None
+        if working_collateral is None and use_proxy:
+            proxy_cs_str = Web3.to_checksum_address(proxy_address)
+            eoa_cs_str   = Web3.to_checksum_address(eoa_address)
+            # Check: would CTF.redeemPositions succeed if called directly from proxy?
+            direct_candidate = None
+            for candidate in candidates_ordered:
+                if _eth_call(proxy_cs_str, CTF_ADDRESS, _redeem_calldata(candidate)):
+                    direct_candidate = candidate
+                    break
+            if direct_candidate:
+                print(f"     ℹ️  CTF direct sim OK (collateral {direct_candidate[:10]}...) — proxy.execute() ABI mismatch")
+                # ── Strategy 2a: Gnosis Safe execTransaction ─────────────────
+                # Polymarket proxy wallets are Gnosis Safes.  Use execTransaction
+                # (with EOA owner signature) instead of the simple execute().
+                print(f"     🔄 Trying Gnosis Safe execTransaction...")
+                _ZERO = "0x0000000000000000000000000000000000000000"
+                _SAFE_ABI = [
+                    {"name": "nonce", "inputs": [], "outputs": [{"type": "uint256"}],
+                     "stateMutability": "view", "type": "function"},
+                    {"name": "getTransactionHash", "inputs": [
+                        {"name": "to",             "type": "address"},
+                        {"name": "value",          "type": "uint256"},
+                        {"name": "data",           "type": "bytes"},
+                        {"name": "operation",      "type": "uint8"},
+                        {"name": "safeTxGas",      "type": "uint256"},
+                        {"name": "baseGas",        "type": "uint256"},
+                        {"name": "gasPrice",       "type": "uint256"},
+                        {"name": "gasToken",       "type": "address"},
+                        {"name": "refundReceiver", "type": "address"},
+                        {"name": "_nonce",         "type": "uint256"},
+                    ], "outputs": [{"type": "bytes32"}],
+                    "stateMutability": "view", "type": "function"},
+                    {"name": "execTransaction", "inputs": [
+                        {"name": "to",             "type": "address"},
+                        {"name": "value",          "type": "uint256"},
+                        {"name": "data",           "type": "bytes"},
+                        {"name": "operation",      "type": "uint8"},
+                        {"name": "safeTxGas",      "type": "uint256"},
+                        {"name": "baseGas",        "type": "uint256"},
+                        {"name": "gasPrice",       "type": "uint256"},
+                        {"name": "gasToken",       "type": "address"},
+                        {"name": "refundReceiver", "type": "address"},
+                        {"name": "signatures",     "type": "bytes"},
+                    ], "outputs": [{"type": "bool"}],
+                    "stateMutability": "payable", "type": "function"},
+                ]
+                try:
+                    proxy_safe = w3.eth.contract(
+                        address=Web3.to_checksum_address(proxy_address), abi=_SAFE_ABI
+                    )
+                    inner = _redeem_calldata(direct_candidate)
+                    safe_nonce = proxy_safe.functions.nonce().call()
+                    safe_tx_hash = proxy_safe.functions.getTransactionHash(
+                        Web3.to_checksum_address(CTF_ADDRESS), 0, inner,
+                        0, 0, 0, 0, _ZERO, _ZERO, safe_nonce,
+                    ).call()
+                    # Sign the raw Safe tx hash (EIP-712, no extra prefix needed)
+                    signed = w3.eth.account.unsafe_sign_hash(safe_tx_hash, private_key=PRIVATE_KEY)
+                    sig = signed.signature
+                    ctf_cs_for_safe = Web3.to_checksum_address(CTF_ADDRESS)
+                    exec_data = proxy_safe.encode_abi(
+                        "execTransaction",
+                        args=[ctf_cs_for_safe, 0, inner, 0, 0, 0, 0, _ZERO, _ZERO, sig],
+                    )
+                    if _eth_call(eoa_address, proxy_cs_str, exec_data):
+                        working_collateral = direct_candidate
+                        use_transfer_strategy = False  # handled differently below
+                        # Store Safe execution context for the send phase
+                        _safe_exec_ctx = (proxy_safe, ctf_cs_for_safe, inner, _ZERO, sig)
+                    else:
+                        print(f"     ⚠️  Safe execTransaction sim failed")
+                        _safe_exec_ctx = None
+                except Exception as _se:
+                    print(f"     ⚠️  Safe execTransaction error: {str(_se)[:100]}")
+                    _safe_exec_ctx = None
+
+                # ── Strategy 2b: setApprovalForAll + transfer fallback ────────
+                if working_collateral is None:
+                    print(f"     🔄 Trying: approve EOA → transfer tokens → redeem from EOA...")
+                    approval_data = _proxy_execute_data(
+                        ctf_contract.encode_abi("setApprovalForAll", args=[eoa_cs_str, True])
+                    )
+                    if _eth_call(eoa_address, proxy_address, approval_data):
+                        working_collateral = direct_candidate
+                        use_transfer_strategy = True
+                    else:
+                        print(f"     ⚠️  setApprovalForAll via proxy.execute() also failed")
+            else:
+                print(f"     ❌ CTF direct sim also failed — conditionId: 0x{condition_id_hex}")
+                print(f"        position_id (asset): {market_info.get('asset')}")
+                print(f"        Market may require NegRisk/custom redemption path")
+                _safe_exec_ctx = None
+
+        if working_collateral is None:
+            print(f"     ❌ All redemption strategies failed simulation.")
+            return None
+
+        collateral_token = working_collateral
+
+        # ── Build and send the transaction(s) ────────────────────────────────
+        # Check if Safe execTransaction context is available and use it
+        _use_safe_exec = (
+            use_proxy and not use_transfer_strategy
+            and working_collateral is not None
+            and _safe_exec_ctx is not None
+        )
+
+        if _use_safe_exec:
+            # Send via Gnosis Safe execTransaction (EOA signs the Safe tx hash)
+            proxy_safe_c, ctf_cs_s, inner_s, zero_s, sig_s = _safe_exec_ctx
+            # Re-sign with fresh nonce (nonce was fetched during simulation)
+            safe_nonce2 = proxy_safe_c.functions.nonce().call()
+            safe_tx_hash2 = proxy_safe_c.functions.getTransactionHash(
+                ctf_cs_s, 0, inner_s, 0, 0, 0, 0, zero_s, zero_s, safe_nonce2,
+            ).call()
+            signed2 = w3.eth.account.unsafe_sign_hash(safe_tx_hash2, private_key=PRIVATE_KEY)
+            sig2 = signed2.signature
+            tx = proxy_safe_c.functions.execTransaction(
+                ctf_cs_s, 0, inner_s, 0, 0, 0, 0, zero_s, zero_s, sig2
             ).build_transaction(base)
-            print(f"     📡 Redeeming directly from EOA...")
+            print(f"     📡 Gnosis Safe execTransaction (collateral: {collateral_token[:10]}...)")
+
+        elif use_transfer_strategy:
+            # Step A: proxy.execute(CTF.setApprovalForAll(EOA, true))
+            approval_calldata = ctf_contract.encode_abi("setApprovalForAll", args=[eoa_address, True])
+            tx_approve = proxy_contract.functions.execute(
+                Web3.to_checksum_address(CTF_ADDRESS), 0, approval_calldata
+            ).build_transaction(base)
+            signed = w3.eth.account.sign_transaction(tx_approve, PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"     📤 Approval tx: {w3.to_hex(tx_hash)}")
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            # Step B: EOA → CTF.safeTransferFrom(proxy, EOA, position_id, balance, "")
+            base["nonce"] += 1
+            winning_pid = position_id_1 if winning_index == 1 else position_id_0
+            tx_transfer = ctf_contract.functions.safeTransferFrom(
+                Web3.to_checksum_address(proxy_address),
+                Web3.to_checksum_address(eoa_address),
+                winning_pid,
+                winning_balance,
+                b"",
+            ).build_transaction(base)
+            signed = w3.eth.account.sign_transaction(tx_transfer, PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"     📤 Transfer tx: {w3.to_hex(tx_hash)}")
+            w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            # Step C: EOA redeems from its own balance
+            base["nonce"] += 1
+            use_proxy = False  # redeem directly from EOA now
+            print(f"     📡 Tokens transferred to EOA — redeeming directly...")
+
+        collateral_cs = Web3.to_checksum_address(collateral_token)
+        if not _use_safe_exec:
+            if use_proxy:
+                redeem_calldata = ctf_contract.encode_abi(
+                    "redeemPositions",
+                    args=[collateral_cs, PARENT_COLLECTION_ID, condition_id_bytes, INDEX_SETS],
+                )
+                tx = proxy_contract.functions.execute(
+                    Web3.to_checksum_address(CTF_ADDRESS), 0, redeem_calldata
+                ).build_transaction(base)
+                print(f"     📡 Routing through proxy: {proxy_address[:10]}... (collateral: {collateral_token[:10]}...)")
+            else:
+                tx = ctf_contract.functions.redeemPositions(
+                    collateral_cs, PARENT_COLLECTION_ID, condition_id_bytes, INDEX_SETS,
+                ).build_transaction(base)
+                print(f"     📡 Redeeming from EOA... (collateral: {collateral_token[:10]}...)")
 
         signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
         tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
