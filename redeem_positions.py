@@ -449,6 +449,7 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
             "asset": _to_int(market.get("asset")),
             "oppositeAsset": _to_int(market.get("oppositeAsset")),
             "outcomeIndex": market.get("outcomeIndex"),
+            "endDate": market.get("endDate") or market.get("end_date") or market.get("resolvedAt"),
         }
         return True
 
@@ -1023,8 +1024,22 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
     redeemed = 0
     pending = 0
     no_balance = 0
+    skipped_old = 0
+
+    cutoff_24h = time.time() - 86400  # 24 hours ago
 
     for cid_hex, info in all_condition_ids.items():
+        end_date_str = info.get("endDate")
+        if end_date_str:
+            try:
+                from datetime import datetime, timezone
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                if end_dt.timestamp() < cutoff_24h:
+                    skipped_old += 1
+                    continue
+            except Exception:
+                pass  # If we can't parse the date, proceed anyway
+
         result = check_and_redeem(
             w3, ctf_contract, eoa_address, cid_hex, info, args.execute,
             proxy_address, proxy_contract,
@@ -1049,6 +1064,7 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
     print("SUMMARY")
     print(f"{'=' * 60}")
     print(f"  Conditions scanned: {len(all_condition_ids)}")
+    print(f"  Skipped (>24h old): {skipped_old}")
     print(f"  Redeemable:         {redeemed}")
     print(f"  Pending resolution: {pending}")
     print(f"  No balance/already redeemed: {no_balance}")
