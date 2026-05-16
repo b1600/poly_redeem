@@ -964,7 +964,7 @@ def check_and_redeem(
         return None
 
 
-LOOP_INTERVAL_SECONDS = 600  # 10 minutes
+LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", 900))
 
 
 def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
@@ -1083,7 +1083,7 @@ def main():
     parser = argparse.ArgumentParser(description="Redeem Polymarket winning positions")
     parser.add_argument("--execute", action="store_true", help="Actually send redemption transactions")
     parser.add_argument("--condition-id", type=str, help="Redeem a specific condition ID (hex)")
-    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit (default: loop every 10 min)")
+    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit (default: loop every 15 min)")
     args = parser.parse_args()
 
     if not PRIVATE_KEY:
