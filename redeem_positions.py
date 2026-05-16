@@ -146,11 +146,13 @@ _alchemy_key = os.environ.get("ALCHEMY_API_KEY", "")
 _default_rpc = f"https://polygon-mainnet.g.alchemy.com/v2/{_alchemy_key}" if _alchemy_key else ""
 RPC_URL = os.environ.get("POLYGON_RPC_URL", _default_rpc)
 
-# Contract addresses on Polygon
-CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens
-USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged)
-NATIVE_USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Native USDC
-COLLATERAL_CANDIDATES = [USDC_E_ADDRESS, NATIVE_USDC_ADDRESS]
+# Contract addresses on Polygon (set in .env)
+CTF_ADDRESS = os.environ.get("CTF_ADDRESS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+USDC_E_ADDRESS = os.environ.get("USDC_E_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+NATIVE_USDC_ADDRESS = os.environ.get("NATIVE_USDC_ADDRESS", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359")
+# pUSD: Polymarket's collateral token since CLOB V2 (April 28, 2026).
+PUSD_ADDRESS = os.environ.get("PUSD_ADDRESS", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+COLLATERAL_CANDIDATES = [PUSD_ADDRESS, USDC_E_ADDRESS, NATIVE_USDC_ADDRESS]
 
 # Polymarket uses parentCollectionId = bytes32(0) for all markets
 PARENT_COLLECTION_ID = bytes(32)
@@ -366,12 +368,12 @@ def _get_proxy_token_ids(address: str, label: str = "proxy") -> set:
     return token_ids
 
 
-def _position_ids_for_condition(condition_id_hex: str) -> tuple:
-    """Return (position_id_0, position_id_1) for a given condition ID hex string."""
+def _position_ids_for_condition(condition_id_hex: str) -> list:
+    """Return [(pid0, pid1), ...] for every collateral candidate."""
     cid_bytes = bytes.fromhex(condition_id_hex.replace("0x", ""))
     col0 = get_collection_id(PARENT_COLLECTION_ID, cid_bytes, 1)
     col1 = get_collection_id(PARENT_COLLECTION_ID, cid_bytes, 2)
-    return get_position_id(USDC_E_ADDRESS, col0), get_position_id(USDC_E_ADDRESS, col1)
+    return [(get_position_id(c, col0), get_position_id(c, col1)) for c in COLLATERAL_CANDIDATES]
 
 
 def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
@@ -429,8 +431,12 @@ def fetch_all_btc5m_conditions(proxy_address: str, eoa_address: str) -> dict:
                 unmatched_ids.difference_update(direct_matched)
             else:
                 # Strategy 2: compute position IDs from condition ID and check
-                pid0, pid1 = _position_ids_for_condition(cid_clean)
-                match = unmatched_ids & {pid0, pid1}
+                # Try each collateral candidate (pUSD for new markets, USDC.e for old ones).
+                match: set = set()
+                for pid0, pid1 in _position_ids_for_condition(cid_clean):
+                    match = unmatched_ids & {pid0, pid1}
+                    if match:
+                        break
                 if not match:
                     return False
                 unmatched_ids.difference_update(match)
@@ -968,7 +974,7 @@ LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", 900))
 
 
 def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
-             proxy_address="", proxy_contract=None):
+             proxy_address="", proxy_contract=None, pusd_contract=None):
     """Run one full scan-and-redeem cycle."""
     # Tokens and USDC live in the proxy; gas comes from the EOA
     holder = Web3.to_checksum_address(proxy_address) if proxy_address else eoa_address
@@ -979,8 +985,10 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
         print("⚠️  Low POL balance — you may not have enough gas to redeem.")
 
     usdc_before = usdc_contract.functions.balanceOf(holder).call()
-    print(f"💰 USDC.e balance (proxy): {usdc_before / 1_000_000:.6f}" if proxy_address
-          else f"💰 USDC.e balance: {usdc_before / 1_000_000:.6f}")
+    pusd_before = pusd_contract.functions.balanceOf(holder).call() if pusd_contract else 0
+    loc = "(proxy)" if proxy_address else ""
+    print(f"💰 USDC.e balance {loc}: {usdc_before / 1_000_000:.6f}")
+    print(f"💰 pUSD balance   {loc}: {pusd_before / 1_000_000:.6f}")
 
     # If specific condition ID provided, just redeem that one
     if args.condition_id:
@@ -1071,10 +1079,11 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
 
     if args.execute and redeemed > 0:
         usdc_after = usdc_contract.functions.balanceOf(holder).call()
-        gained = (usdc_after - usdc_before) / 1_000_000
-        print(f"\n  💰 USDC.e before: {usdc_before / 1_000_000:.6f}")
-        print(f"  💰 USDC.e after:  {usdc_after / 1_000_000:.6f}")
-        print(f"  💰 Gained:        {gained:.6f} USDC.e")
+        pusd_after = pusd_contract.functions.balanceOf(holder).call() if pusd_contract else 0
+        gained_usdc = (usdc_after - usdc_before) / 1_000_000
+        gained_pusd = (pusd_after - pusd_before) / 1_000_000
+        print(f"\n  💰 USDC.e before: {usdc_before / 1_000_000:.6f}  after: {usdc_after / 1_000_000:.6f}  gained: {gained_usdc:+.6f}")
+        print(f"  💰 pUSD before:   {pusd_before / 1_000_000:.6f}  after: {pusd_after / 1_000_000:.6f}  gained: {gained_pusd:+.6f}")
     elif not args.execute and redeemed > 0:
         print(f"\n  ℹ️  Run with --execute to actually redeem")
 
@@ -1114,13 +1123,16 @@ def main():
     usdc_contract = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_E_ADDRESS), abi=USDC_ABI
     )
+    pusd_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(PUSD_ADDRESS), abi=USDC_ABI
+    )
     ctf_contract = w3.eth.contract(
         address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI
     )
 
     if args.once:
         run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
-                 proxy_address, proxy_contract)
+                 proxy_address, proxy_contract, pusd_contract)
         return
 
     print(f"🔁 Running continuously every {LOOP_INTERVAL_SECONDS // 60} minutes. Press Ctrl+C to stop.\n")
@@ -1135,7 +1147,7 @@ def main():
             for attempt in range(1, 4):
                 try:
                     run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
-                             proxy_address, proxy_contract)
+                             proxy_address, proxy_contract, pusd_contract)
                     break  # success
                 except Exception as e:
                     err = str(e)
