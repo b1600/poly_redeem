@@ -154,6 +154,8 @@ NATIVE_USDC_ADDRESS = os.environ.get("NATIVE_USDC_ADDRESS", "0x3c499c542cEF5E381
 PUSD_ADDRESS = os.environ.get("PUSD_ADDRESS", "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 COLLATERAL_CANDIDATES = [PUSD_ADDRESS, USDC_E_ADDRESS, NATIVE_USDC_ADDRESS]
 
+UNISWAP_V3_ROUTER = os.environ.get("UNISWAP_V3_ROUTER", "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45")
+
 # Polymarket uses parentCollectionId = bytes32(0) for all markets
 PARENT_COLLECTION_ID = bytes(32)
 
@@ -286,6 +288,16 @@ USDC_ABI = json.loads("""[
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount",  "type": "uint256"}
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function"
     }
 ]""")
 
@@ -303,6 +315,29 @@ PROXY_ABI = json.loads("""[
             {"name": "returnData", "type": "bytes"}
         ],
         "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]""")
+
+
+SWAP_ROUTER_ABI = json.loads("""[
+    {
+        "inputs": [{
+            "components": [
+                {"name": "tokenIn",           "type": "address"},
+                {"name": "tokenOut",          "type": "address"},
+                {"name": "fee",               "type": "uint24"},
+                {"name": "recipient",         "type": "address"},
+                {"name": "amountIn",          "type": "uint256"},
+                {"name": "amountOutMinimum",  "type": "uint256"},
+                {"name": "sqrtPriceLimitX96", "type": "uint160"}
+            ],
+            "name": "params",
+            "type": "tuple"
+        }],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
         "type": "function"
     }
 ]""")
@@ -970,6 +1005,185 @@ def check_and_redeem(
         return None
 
 
+def convert_usdc_e_to_pusd(w3, eoa_address, usdc_e_contract, pusd_contract,
+                           proxy_address="", execute=False):
+    """Swap any USDC.e balance in the proxy (or EOA) to pUSD via Uniswap V3."""
+    holder = Web3.to_checksum_address(proxy_address) if proxy_address else Web3.to_checksum_address(eoa_address)
+    usdc_balance = usdc_e_contract.functions.balanceOf(holder).call()
+
+    if usdc_balance == 0:
+        return
+
+    print(f"\n{'=' * 60}")
+    print("PHASE 3: Converting USDC.e → pUSD")
+    print(f"{'=' * 60}")
+    print(f"  💱 {usdc_balance / 1_000_000:.6f} USDC.e → pUSD")
+
+    if not execute:
+        print(f"  🔍 DRY RUN — would swap {usdc_balance / 1_000_000:.6f} USDC.e → pUSD via Uniswap V3")
+        return
+
+    router_cs = Web3.to_checksum_address(UNISWAP_V3_ROUTER)
+    usdc_e_cs = Web3.to_checksum_address(USDC_E_ADDRESS)
+    pusd_cs   = Web3.to_checksum_address(PUSD_ADDRESS)
+    min_out   = int(usdc_balance * 99 // 100)  # 1% max slippage
+    router    = w3.eth.contract(address=router_cs, abi=SWAP_ROUTER_ABI)
+
+    def _eth_call_ok(from_addr, to_addr, data):
+        try:
+            w3.eth.call({"from": from_addr, "to": to_addr, "data": data})
+            return True
+        except Exception:
+            return False
+
+    try:
+        if proxy_address:
+            proxy_cs = Web3.to_checksum_address(proxy_address)
+            _ZERO = "0x0000000000000000000000000000000000000000"
+            _SAFE_ABI_LOCAL = [
+                {"name": "nonce", "inputs": [], "outputs": [{"type": "uint256"}],
+                 "stateMutability": "view", "type": "function"},
+                {"name": "getTransactionHash", "inputs": [
+                    {"name": "to",             "type": "address"},
+                    {"name": "value",          "type": "uint256"},
+                    {"name": "data",           "type": "bytes"},
+                    {"name": "operation",      "type": "uint8"},
+                    {"name": "safeTxGas",      "type": "uint256"},
+                    {"name": "baseGas",        "type": "uint256"},
+                    {"name": "gasPrice",       "type": "uint256"},
+                    {"name": "gasToken",       "type": "address"},
+                    {"name": "refundReceiver", "type": "address"},
+                    {"name": "_nonce",         "type": "uint256"},
+                ], "outputs": [{"type": "bytes32"}],
+                "stateMutability": "view", "type": "function"},
+                {"name": "execTransaction", "inputs": [
+                    {"name": "to",             "type": "address"},
+                    {"name": "value",          "type": "uint256"},
+                    {"name": "data",           "type": "bytes"},
+                    {"name": "operation",      "type": "uint8"},
+                    {"name": "safeTxGas",      "type": "uint256"},
+                    {"name": "baseGas",        "type": "uint256"},
+                    {"name": "gasPrice",       "type": "uint256"},
+                    {"name": "gasToken",       "type": "address"},
+                    {"name": "refundReceiver", "type": "address"},
+                    {"name": "signatures",     "type": "bytes"},
+                ], "outputs": [{"type": "bool"}],
+                "stateMutability": "payable", "type": "function"},
+            ]
+            proxy_safe = w3.eth.contract(address=proxy_cs, abi=_SAFE_ABI_LOCAL)
+
+            def _safe_send(to_addr, calldata, gas=300_000):
+                safe_nonce = proxy_safe.functions.nonce().call()
+                safe_tx_hash = proxy_safe.functions.getTransactionHash(
+                    Web3.to_checksum_address(to_addr), 0, calldata,
+                    0, 0, 0, 0, _ZERO, _ZERO, safe_nonce,
+                ).call()
+                signed = w3.eth.account.unsafe_sign_hash(safe_tx_hash, private_key=PRIVATE_KEY)
+                nonce = w3.eth.get_transaction_count(eoa_address)
+                base = {
+                    "from": eoa_address, "nonce": nonce, "gas": gas,
+                    "maxFeePerGas": w3.eth.gas_price * 2,
+                    "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+                    "chainId": 137,
+                }
+                tx = proxy_safe.functions.execTransaction(
+                    Web3.to_checksum_address(to_addr), 0, calldata,
+                    0, 0, 0, 0, _ZERO, _ZERO, signed.signature,
+                ).build_transaction(base)
+                signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+                tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                print(f"     📤 Tx sent: {w3.to_hex(tx_hash)}")
+                print(f"     ⏳ Waiting for confirmation...")
+                return w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            # Step 1: approve router to spend USDC.e from proxy
+            print(f"  📡 Step 1/2: Approving Uniswap router (Safe execTransaction)...")
+            approve_data = usdc_e_contract.encode_abi("approve", args=[router_cs, usdc_balance])
+            receipt = _safe_send(usdc_e_cs, approve_data, gas=200_000)
+            if receipt["status"] != 1:
+                print(f"  ❌ Approval tx reverted")
+                return
+            print(f"  ✅ Approved. Gas: {receipt['gasUsed']:,}")
+
+            # Step 2: find working fee tier, then swap
+            working_fee = None
+            for fee in [100, 500, 3000]:
+                params = (usdc_e_cs, pusd_cs, fee, proxy_cs, usdc_balance, min_out, 0)
+                if _eth_call_ok(proxy_cs, router_cs, router.encode_abi("exactInputSingle", args=[params])):
+                    working_fee = fee
+                    break
+                print(f"  ⚠️  Swap sim failed for fee tier {fee}")
+
+            if working_fee is None:
+                print(f"  ❌ No viable Uniswap pool found — swap skipped.")
+                return
+
+            swap_params = (usdc_e_cs, pusd_cs, working_fee, proxy_cs, usdc_balance, min_out, 0)
+            swap_data   = router.encode_abi("exactInputSingle", args=[swap_params])
+            print(f"  📡 Step 2/2: Swapping via Uniswap V3 (fee tier: {working_fee / 10_000:.2f}%)...")
+            receipt = _safe_send(router_cs, swap_data, gas=400_000)
+            if receipt["status"] != 1:
+                print(f"  ❌ Swap tx reverted")
+                return
+
+        else:
+            # EOA path (no proxy)
+            eoa_cs = Web3.to_checksum_address(eoa_address)
+            nonce  = w3.eth.get_transaction_count(eoa_address)
+            base   = {
+                "from": eoa_address, "nonce": nonce, "gas": 200_000,
+                "maxFeePerGas": w3.eth.gas_price * 2,
+                "maxPriorityFeePerGas": w3.to_wei(30, "gwei"),
+                "chainId": 137,
+            }
+
+            print(f"  📡 Step 1/2: Approving Uniswap router...")
+            approve_tx = usdc_e_contract.functions.approve(router_cs, usdc_balance).build_transaction(base)
+            signed     = w3.eth.account.sign_transaction(approve_tx, PRIVATE_KEY)
+            tx_hash    = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"     📤 Tx sent: {w3.to_hex(tx_hash)}")
+            print(f"     ⏳ Waiting for confirmation...")
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt["status"] != 1:
+                print(f"  ❌ Approval reverted")
+                return
+            print(f"  ✅ Approved. Gas: {receipt['gasUsed']:,}")
+
+            working_fee = None
+            for fee in [100, 500, 3000]:
+                params = (usdc_e_cs, pusd_cs, fee, eoa_cs, usdc_balance, min_out, 0)
+                if _eth_call_ok(eoa_cs, router_cs, router.encode_abi("exactInputSingle", args=[params])):
+                    working_fee = fee
+                    break
+                print(f"  ⚠️  Swap sim failed for fee tier {fee}")
+
+            if working_fee is None:
+                print(f"  ❌ No viable Uniswap pool found — swap skipped.")
+                return
+
+            base["nonce"] += 1
+            base["gas"]    = 400_000
+            swap_params = (usdc_e_cs, pusd_cs, working_fee, eoa_cs, usdc_balance, min_out, 0)
+            swap_tx     = router.functions.exactInputSingle(swap_params).build_transaction(base)
+            print(f"  📡 Step 2/2: Swapping via Uniswap V3 (fee tier: {working_fee / 10_000:.2f}%)...")
+            signed  = w3.eth.account.sign_transaction(swap_tx, PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            print(f"     📤 Tx sent: {w3.to_hex(tx_hash)}")
+            print(f"     ⏳ Waiting for confirmation...")
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt["status"] != 1:
+                print(f"  ❌ Swap reverted")
+                return
+
+        usdc_after = usdc_e_contract.functions.balanceOf(holder).call()
+        pusd_after = pusd_contract.functions.balanceOf(holder).call()
+        print(f"  ✅ Converted! Gas: {receipt['gasUsed']:,}")
+        print(f"  💰 USDC.e: {usdc_after / 1_000_000:.6f}   pUSD: {pusd_after / 1_000_000:.6f}")
+
+    except Exception as e:
+        print(f"  ❌ Conversion error: {e}")
+
+
 LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", 900))
 
 
@@ -1011,6 +1225,8 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
 
         check_and_redeem(w3, ctf_contract, eoa_address, cid, info, args.execute,
                          proxy_address, proxy_contract)
+        convert_usdc_e_to_pusd(w3, eoa_address, usdc_contract, pusd_contract,
+                               proxy_address, execute=args.execute)
         return
 
     # Discover all BTC Up/Down 5m conditions across every time frame
@@ -1086,6 +1302,9 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
         print(f"  💰 pUSD before:   {pusd_before / 1_000_000:.6f}  after: {pusd_after / 1_000_000:.6f}  gained: {gained_pusd:+.6f}")
     elif not args.execute and redeemed > 0:
         print(f"\n  ℹ️  Run with --execute to actually redeem")
+
+    convert_usdc_e_to_pusd(w3, eoa_address, usdc_contract, pusd_contract,
+                           proxy_address, execute=args.execute)
 
 
 def main():
