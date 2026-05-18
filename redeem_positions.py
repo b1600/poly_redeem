@@ -1006,10 +1006,10 @@ def check_and_redeem(
 
 
 def convert_usdc_e_to_pusd(w3, eoa_address, usdc_e_contract, pusd_contract,
-                           proxy_address="", execute=False):
+                           proxy_address="", execute=False, known_balance=0):
     """Swap any USDC.e balance in the proxy (or EOA) to pUSD via Uniswap V3."""
     holder = Web3.to_checksum_address(proxy_address) if proxy_address else Web3.to_checksum_address(eoa_address)
-    usdc_balance = usdc_e_contract.functions.balanceOf(holder).call()
+    usdc_balance = known_balance if known_balance > 0 else usdc_e_contract.functions.balanceOf(holder).call()
 
     if usdc_balance == 0:
         return
@@ -1204,6 +1204,12 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
     print(f"💰 USDC.e balance {loc}: {usdc_before / 1_000_000:.6f}")
     print(f"💰 pUSD balance   {loc}: {pusd_before / 1_000_000:.6f}")
 
+    if usdc_before > 0:
+        convert_usdc_e_to_pusd(w3, eoa_address, usdc_contract, pusd_contract,
+                               proxy_address, execute=args.execute, known_balance=usdc_before)
+        usdc_before = usdc_contract.functions.balanceOf(holder).call()
+        pusd_before = pusd_contract.functions.balanceOf(holder).call() if pusd_contract else 0
+
     # If specific condition ID provided, just redeem that one
     if args.condition_id:
         cid = args.condition_id.replace("0x", "")
@@ -1303,8 +1309,9 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
     elif not args.execute and redeemed > 0:
         print(f"\n  ℹ️  Run with --execute to actually redeem")
 
+    usdc_end = usdc_contract.functions.balanceOf(holder).call()
     convert_usdc_e_to_pusd(w3, eoa_address, usdc_contract, pusd_contract,
-                           proxy_address, execute=args.execute)
+                           proxy_address, execute=args.execute, known_balance=usdc_end)
 
 
 def main():
