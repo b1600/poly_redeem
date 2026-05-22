@@ -1264,6 +1264,8 @@ def run_once(w3, ctf_contract, usdc_contract, eoa_address, args,
             try:
                 from datetime import datetime, timezone
                 end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
                 if end_dt.timestamp() < cutoff_24h:
                     skipped_old += 1
                     continue
