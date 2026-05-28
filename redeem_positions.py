@@ -657,7 +657,6 @@ def check_and_redeem(
         return None
 
     if payout_denominator == 0:
-        print(f"  ⏳ Not yet resolved: {market_info.get('question', condition_id_hex[:20])}")
         return None
 
     # Get payout numerators for both outcomes
